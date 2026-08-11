@@ -1,0 +1,33 @@
+﻿.venv\Scripts\python.exe : Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+At line:1 char:32
++ ... NG="utf-8"; .venv\Scripts\python.exe -X utf8 test_api_flow.py 2>&1 |  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Could not get F...sed as 4 floats:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+job: 9215af01bcf5
+students parsed: 22
+mat-check: Counter({'not_found': 19, 'mismatch': 2, 'verified': 1}) | checked 22 / 22
+override ok: LMU24NUR015 -> LMU24NUR016
+form-b dept/level: NURSING 200 | catalogs: ['FORM B LEVEL 300 NURSING.xlsx']
+form-b (from uploads): 31 courses, 22 students
+form-b xlsx built, size: 9880 bytes
+form-b catalogue compare: FORM B LEVEL 300 NURSING.xlsx
+    Γ£ô  Excel saved ΓåÆ E:\Documents\python\Conversion engine\outputs\Results_NURSING_200_2023-2024_20260804_101039.xlsx
+excel built, size: 30378 bytes
+results workbook sheets: ['Results', 'Summary', 'Legend', 'Form B']
+
+API FLOW PASSED
