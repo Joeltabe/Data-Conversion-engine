@@ -4,15 +4,26 @@ Transcript Conversion System — Flask Backend
 Run:  python app.py
 Open: http://localhost:5000
 """
-import os, sys, json, uuid, traceback, threading, requests
+import os, re, sys, json, uuid, traceback, threading, requests, time
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_file, render_template, send_from_directory
 
 sys.path.insert(0, os.path.dirname(__file__))
 from pdf_to_excel_engine import (
     parse_pdf, validate_all, build_excel,
     StudentRecord, CourseRecord, DEFAULT_SCHOOL_ID, log as engine_log
+)
+from matchers import (
+    build_candidates, build_name_queries, classify_match,
+    name_similarity, matricule_similarity, parse_api_payload,
+    score_candidate,
+)
+from form_b import (
+    load_form_b, find_catalogs, majority_specialty,
+    infer_department, detect_department, cross_check, build_form_b_excel,
+    parse_catalog_filename, derive_form_b_from_students,
 )
 
 app = Flask(__name__)
@@ -21,8 +32,10 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 BASE      = Path(__file__).parent
 UPLOAD_DIR = BASE / "uploads"
 OUTPUT_DIR = BASE / "outputs"
+FORM_B_DIR = BASE / "form_b"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+FORM_B_DIR.mkdir(exist_ok=True)
 
 jobs = {}
 jobs_lock = threading.Lock()
@@ -116,7 +129,7 @@ def run_parse_job(job_id, pdf_paths, school_id):
                     "files": [Path(p).name for p in pdf_paths],
                     "school_id": school_id,
                     "parsed_at": datetime.now().isoformat(),
-                    "specialty": all_students[0].specialty if all_students else "",
+                    "specialty": majority_specialty(all_students),
                     "level": all_students[0].level if all_students else "",
                     "year": all_students[0].academic_year if all_students else "",
                 }
@@ -151,9 +164,11 @@ def run_excel_job(job_id, school_id, overrides):
                                 push(f"Override: {mat}/{c.code} Sem{c.semester} CA={c.ca} Exam={c.exam}", "warn")
 
         push("Building Excel…")
-        fname    = f"Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        fname    = _results_fname(job_id, raw)
         out_path = str(OUTPUT_DIR / fname)
-        build_excel(raw, out_path, school_id)
+        with jobs_lock:
+            form_b_rows = jobs[job_id]["form_b"].get("rows") or []
+        build_excel(raw, out_path, school_id, form_b_rows=form_b_rows)
 
         with jobs_lock:
             jobs[job_id].update({"output_file": fname, "status": "done", "progress": 100})
@@ -187,7 +202,10 @@ def api_upload():
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         jobs[job_id] = {"status":"parsing","progress":0,"log":[],"students":[],
-                        "errors":{},"_raw":[],"output_file":None,"meta":{},"dismissed_errors":False}
+                        "errors":{},"_raw":[],"output_file":None,"meta":{},"dismissed_errors":False,
+                        "mat_check":{"status":"idle","progress":0,"results":[],"checked":0,"total":0},
+                        "form_b":{"status":"idle","catalog":None,"department":"","level":"",
+                                  "rows":[],"stats":None,"output_file":None,"error":None}}
 
     threading.Thread(target=run_parse_job, args=(job_id,saved,school_id), daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -281,164 +299,474 @@ def api_patch(job_id, matricule):
 
 
 # ── Matricule Check ────────────────────────────────────────────────────────
-API_BASE  = "https://study.landmark.cm/matriculeCheck.php"
-API_YEAR  = "2024/2025"
-API_SKEY  = "123456Q"
+API_BASE   = "https://study.landmark.cm/matriculeCheck.php"
+API_YEARS  = ["2025/2026", "2024/2025", "2023/2024"]
+API_SKEY   = "123456Q"
+MC_WORKERS      = 8      # concurrent portal requests
+MC_TIMEOUT      = 8      # seconds per request
+MC_RETRIES      = 2      # retries on transient failure
+MC_QUERY_PHASE1 = 6      # queries per student in the first pass
+MC_QUERY_PHASE2 = 16     # expanded budget for unresolved students
+MC_RATE_INTERVAL = 0.12  # min seconds between portal requests
 
-import difflib
 
-def _name_variations(name):
-    parts = name.strip().upper().split()
-    if not parts:
-        return []
-    seen = set()
-    out = []
-    def add(v):
-        v = v.strip()
-        if v and v not in seen:
-            seen.add(v); out.append(v)
-    add(name.strip())
-    if len(parts) == 1:
-        return out
-    # Every single word
-    for p in parts:
-        add(p)
-    # Every rotation
-    for i in range(len(parts)):
-        r = parts[i:] + parts[:i]
-        add(" ".join(r))
-        if len(r) >= 2:
-            add(f"{r[0]} {r[-1][0]}")    # "FIRST L."
-            add(f"{r[-1]} {r[0][0]}")    # "LAST F."
-    # Common orderings: first+last, last+first
-    add(f"{parts[0]} {parts[-1]}")
-    add(f"{parts[-1]} {parts[0]}")
-    # With initials
-    if len(parts[-1]) >= 1:
-        add(f"{parts[0]} {parts[-1][0]}")
-    if len(parts[0]) >= 1:
-        add(f"{parts[-1]} {parts[0][0]}")
-    # All word pairs
-    for i in range(len(parts)):
-        for j in range(len(parts)):
-            if i != j:
-                add(f"{parts[i]} {parts[j]}")
-    return out
+def academic_years(back=15):
+    """Descending list of academic years from the current one, e.g.
+    ['2025/2026', '2024/2025', ...]. A new academic year begins in September."""
+    now = datetime.now()
+    start = now.year if now.month >= 9 else now.year - 1
+    return [f"{y}/{y + 1}" for y in range(start, start - back - 1, -1)]
 
-def _name_similarity(a, b):
-    return difflib.SequenceMatcher(None, a.strip().upper(), b.strip().upper()).ratio()
 
-@app.route("/api/job/<job_id>/matricule-check", methods=["POST"])
-def api_matricule_check(job_id):
-    with jobs_lock:
-        if job_id not in jobs: return jsonify({"error":"Unknown job"}),404
-        students_data = jobs[job_id].get("students", [])
+class _RateLimiter:
+    """Paces outbound requests so the portal never gets hammered."""
 
-    # Query cache across all students to avoid redundant API calls
-    _qcache = {}
+    def __init__(self, min_interval=MC_RATE_INTERVAL):
+        self._lock = threading.Lock()
+        self._min = min_interval
+        self._next = 0.0
 
-    def _query_portal(q):
-        if q in _qcache:
-            return _qcache[q]
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            self._next = max(now, self._next) + self._min
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _ordered_years(student, years):
+    """Student's own academic year first, then the fallback year list."""
+    own = student.get("academic_year", "")
+    ordered = []
+    for y in ([own] if own else []) + list(years):
+        if y not in ordered:
+            ordered.append(y)
+    return ordered
+
+
+def _query_portal(q, year, session, cache, limiter):
+    key = (q.upper(), year)
+    if key in cache:
+        return cache[key]
+    for attempt in range(MC_RETRIES + 1):
         try:
-            resp = requests.get(API_BASE, params={
-                "year": API_YEAR, "skey": API_SKEY, "name": q,
-            }, timeout=5)
-            _qcache[q] = (resp.status_code, resp.json() if resp.status_code == 200 else None)
+            limiter.wait()
+            resp = session.get(API_BASE, params={
+                "year": year, "skey": API_SKEY, "name": q,
+            }, timeout=MC_TIMEOUT)
+            payload = None
+            if resp.status_code == 200:
+                payload = parse_api_payload(resp.json())
+            cache[key] = (resp.status_code, payload)
+            return cache[key]
         except Exception:
-            _qcache[q] = (0, None)
-        return _qcache[q]
+            if attempt < MC_RETRIES:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            cache[key] = (0, None)
+            return cache[key]
+
+
+def _run_matricule_check(student_dicts, years=None, progress_cb=None):
+    """Check every student against the portal with bounded, cached,
+    concurrent queries across the given academic years. Returns the
+    per-student result list."""
+    years = years or API_YEARS
+    total = len(student_dicts)
+    checked = 0
+    cache = {}
+    limiter = _RateLimiter()
+    # idx -> {api_matricule: {"name","years":set,"query_used"}}
+    raw = [{} for _ in student_dicts]
+    unresolved = set(range(total))
+
+    def progress(delta):
+        nonlocal checked
+        checked += delta
+        if progress_cb:
+            progress_cb(min(checked, total), total)
+
+    with requests.Session() as session:
+        for phase, cutoff in ((1, MC_QUERY_PHASE1), (2, MC_QUERY_PHASE2)):
+            tasks = []
+            for idx in sorted(unresolved):
+                s = student_dicts[idx]
+                queries = build_name_queries(s.get("name", ""), limit=cutoff)
+                qs = queries[:MC_QUERY_PHASE1] if phase == 1 else queries[MC_QUERY_PHASE1:]
+                for q in qs:
+                    for year in _ordered_years(s, years):
+                        tasks.append((idx, q, year))
+            if not tasks:
+                break
+
+            with ThreadPoolExecutor(max_workers=MC_WORKERS) as ex:
+                futures = {
+                    ex.submit(_query_portal, q, year, session, cache, limiter): (idx, q, year)
+                    for (idx, q, year) in tasks
+                }
+                for fut in as_completed(futures):
+                    idx, q, year = futures[fut]
+                    _, payload = fut.result()
+                    if payload:
+                        rec = raw[idx]
+                        mat = payload["matricule"]
+                        entry = rec.get(mat)
+                        if entry is None:
+                            rec[mat] = {
+                                "name": payload["name"],
+                                "years": {year},
+                                "query_used": q,
+                            }
+                        else:
+                            if payload["name"] and not entry["name"]:
+                                entry["name"] = payload["name"]
+                            entry["years"].add(year)
+                    progress(1)
+
+            if phase == 1:
+                still = set()
+                for idx in unresolved:
+                    s = student_dicts[idx]
+                    cands = build_candidates(s.get("name", ""), s.get("matricule", ""), raw[idx])
+                    if cands and classify_match(s.get("name", ""), s.get("matricule", ""), cands) == "verified":
+                        continue
+                    still.add(idx)
+                unresolved = still
 
     results = []
-    for s in students_data:
-        mat  = s.get("matricule","")
-        name = s.get("name","")
+    for idx, s in enumerate(student_dicts):
+        pdf_name = s.get("name", "")
+        pdf_mat = s.get("matricule", "")
         res = {
-            "matricule": mat, "name": name,
-            "api_matched": False, "api_matricule": None,
-            "api_name": None, "mismatch": False,
-            "similarity": 0.0, "candidates": [],
-            "error": None,
+            "matricule": pdf_mat, "name": pdf_name,
+            "status": "skipped", "api_matched": False,
+            "api_matricule": None, "api_name": None,
+            "mismatch": False, "similarity": 0.0, "confidence": 0.0,
+            "name_similarity": 0.0, "matricule_matched": False,
+            "candidates": [], "years": [], "error": None, "reason": "",
         }
-        if not name:
-            res["error"] = "No name to search"; results.append(res); continue
+        if not pdf_name:
+            res["error"] = "No name to search"
+            results.append(res)
+            continue
 
-        queries = _name_variations(name)
-        seen_candidates = {}
-        for q in queries:
-            status_code, api = _query_portal(q)
-            if status_code == 200 and api and api.get("matricule"):
-                api_mat = api["matricule"].strip()
-                api_nam = api.get("fname","").strip()
-                if api_mat not in seen_candidates:
-                    sim = _name_similarity(name, api_nam)
-                    seen_candidates[api_mat] = {
-                        "matricule": api_mat,
-                        "name": api_nam,
-                        "similarity": round(sim, 4),
-                        "query_used": q,
-                    }
-
-        candidates = sorted(seen_candidates.values(), key=lambda c: -c["similarity"])
-        if candidates:
-            best = candidates[0]
-            res["api_matched"] = True
-            res["api_matricule"] = best["matricule"]
-            res["api_name"] = best["name"]
-            res["similarity"] = best["similarity"]
-            res["candidates"] = candidates
-            if best["matricule"].upper() != mat.strip().upper():
-                res["mismatch"] = True
+        cands = build_candidates(pdf_name, pdf_mat, raw[idx])[:8]
+        status = classify_match(pdf_name, pdf_mat, cands)
+        res["status"] = status
+        res["candidates"] = cands
+        if cands:
+            best = cands[0]
+            res.update({
+                "api_matched": True,
+                "api_matricule": best["matricule"],
+                "api_name": best["name"],
+                "similarity": best["confidence"],
+                "confidence": best["confidence"],
+                "name_similarity": best["name_similarity"],
+                "matricule_matched": best["matricule_similarity"] >= 0.9,
+                "years": best["years"],
+                "mismatch": status == "mismatch",
+            })
+            if status == "mismatch":
+                res["reason"] = "Portal matricule differs from PDF matricule"
+            elif status == "review":
+                res["reason"] = "Low confidence — review candidates manually"
         else:
-            res["candidates"] = []
-            if not res["error"]:
-                res["error"] = "Not found in API"
-
+            res["error"] = "Not found in API"
         results.append(res)
+    return results
 
-    return jsonify({"results": results})
+
+def run_matricule_check_job(job_id):
+    def progress(done, total):
+        with jobs_lock:
+            mc = jobs[job_id].get("mat_check")
+            if not mc:
+                return
+            mc["checked"] = done
+            mc["progress"] = round(done / total * 100) if total else 0
+
+    try:
+        with jobs_lock:
+            student_dicts = jobs[job_id].get("students", [])
+            years = jobs[job_id].get("mat_check", {}).get("years") or API_YEARS
+        results = _run_matricule_check(student_dicts, years, progress_cb=progress)
+        with jobs_lock:
+            jobs[job_id]["mat_check"].update({
+                "status": "done", "progress": 100, "results": results,
+                "checked": len(student_dicts), "total": len(student_dicts),
+                "years": years,
+            })
+    except Exception as e:
+        traceback.print_exc()
+        with jobs_lock:
+            jobs[job_id]["mat_check"].update({"status": "failed", "error": str(e)})
+
+
+@app.route("/api/academic-years")
+def api_academic_years():
+    return jsonify({"years": academic_years()})
+
+
+@app.route("/api/job/<job_id>/matricule-check", methods=["GET", "POST"])
+def api_matricule_check(job_id):
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Unknown job"}), 404
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        valid = set(academic_years())
+        years = [str(y).strip() for y in (data.get("years") or [])]
+        years = [y for y in years if y in valid] or API_YEARS
+        with jobs_lock:
+            mc = jobs[job_id].get("mat_check")
+            if mc and mc.get("status") == "running":
+                return jsonify({"ok": True, "running": True})
+            jobs[job_id]["mat_check"] = {
+                "status": "running", "progress": 0, "results": [],
+                "checked": 0, "total": 0, "years": years,
+            }
+        threading.Thread(target=run_matricule_check_job, args=(job_id,), daemon=True).start()
+        return jsonify({"ok": True, "running": True})
+
+    with jobs_lock:
+        mc = jobs[job_id].get("mat_check") or {
+            "status": "idle", "progress": 0, "results": [],
+            "checked": 0, "total": 0, "years": API_YEARS,
+        }
+    return jsonify(mc)
+
+
+def _apply_override_locked(job_id, old_mat, new_mat, old_name=None):
+    """Apply one matricule override and rebuild the affected student dict.
+    When ``old_mat`` is empty the student is located by ``old_name`` instead
+    (for transcripts whose matricule was never detected).
+    Caller must hold ``jobs_lock``. Returns ``(ok, payload)``."""
+    raw = jobs[job_id]["_raw"]
+    stu_list = jobs[job_id]["students"]
+
+    target = None
+    if old_mat:
+        target = next((s for s in raw if s.matricule == old_mat), None)
+    if target is None and old_name:
+        target = next((s for s in raw if s.name == old_name), None)
+    if target is None:
+        return False, {"error": f"Student {old_mat or old_name} not found in raw data"}
+
+    target.matricule = new_mat
+    old_key = old_mat if old_mat else (old_name or "")
+
+    for s in raw:
+        if s.matricule == new_mat:
+            sd = student_to_dict(s)
+            for i, ex in enumerate(stu_list):
+                if (old_mat and ex["matricule"] == old_mat) or \
+                   (not old_mat and ex["name"] == old_name):
+                    stu_list[i] = sd
+                    errors = jobs[job_id]["errors"]
+                    if old_key in errors:
+                        errors[new_mat] = errors.pop(old_key)
+                    if sd["valid"]:
+                        errors.pop(new_mat, None)
+                    else:
+                        errors[new_mat] = sd["errors"]
+                    return True, {"student": sd, "old_matricule": old_key,
+                                  "new_matricule": new_mat}
+            break
+    return False, {"error": "Could not apply override"}
 
 
 @app.route("/api/job/<job_id>/matricule-override", methods=["POST"])
 def api_matricule_override(job_id):
     data = request.get_json() or {}
-    old_mat = data.get("old_matricule","")
-    new_mat = data.get("new_matricule","")
+    old_mat = (data.get("old_matricule") or "").strip()
+    new_mat = (data.get("new_matricule") or "").strip()
     if not old_mat or not new_mat:
-        return jsonify({"error":"old_matricule and new_matricule required"}),400
+        return jsonify({"error": "old_matricule and new_matricule required"}), 400
 
     with jobs_lock:
-        if job_id not in jobs: return jsonify({"error":"Unknown job"}),404
+        if job_id not in jobs:
+            return jsonify({"error": "Unknown job"}), 404
+        ok, payload = _apply_override_locked(job_id, old_mat, new_mat)
+    status = 404 if "not found" in payload.get("error", "") else 400
+    return jsonify(payload), (200 if ok else status)
+
+
+@app.route("/api/job/<job_id>/matricule-bulk", methods=["POST"])
+def api_matricule_bulk(job_id):
+    data = request.get_json() or {}
+    mappings = data.get("mappings") or []
+
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Unknown job"}), 404
+        applied, failures = [], []
+        for m in mappings:
+            old_m = (m.get("old_matricule") or m.get("from") or "").strip()
+            old_n = (m.get("old_name") or "").strip()
+            new_m = (m.get("new_matricule") or m.get("to") or "").strip()
+            if (not old_m and not old_n) or not new_m:
+                failures.append({"old": old_m or old_n, "new": new_m,
+                                 "error": "missing old/new matricule"})
+                continue
+            ok, payload = _apply_override_locked(job_id, old_m, new_m, old_name=old_n)
+            if ok:
+                applied.append(payload)
+            else:
+                failures.append({"old": old_m or old_n, "new": new_m,
+                                 "error": payload.get("error")})
+    return jsonify({"ok": True, "applied": len(applied), "failures": failures})
+
+
+# ── FORM B ──────────────────────────────────────────────────────────────────
+def _safe_tag(text):
+    tag = re.sub(r"[^A-Z0-9]+", "-", str(text or "").upper()).strip("-")
+    return tag or ""
+
+
+def _results_fname(job_id, raw):
+    """Descriptive output name: Results_<DEPARTMENT>_<LEVEL>_<YEAR>_<ts>.xlsx"""
+    with jobs_lock:
+        meta = jobs[job_id].get("meta", {})
+    dept  = infer_department(raw)
+    level = meta.get("level") or (raw[0].level if raw else "")
+    year  = meta.get("year") or (raw[0].academic_year if raw else "")
+    parts = [p for p in ["Results", _safe_tag(dept), _safe_tag(level),
+                         _safe_tag(year)] if p]
+    core  = "_".join(parts)
+    return f"{core}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+
+def _job_form_b_context(job_id):
+    """Detect department/level for a job and list available catalogues."""
+    with jobs_lock:
+        if job_id not in jobs:
+            return None
+        students = jobs[job_id].get("students", [])
+        level = jobs[job_id].get("meta", {}).get("level", "")
+        state = jobs[job_id]["form_b"]
+
+    matricules = [s.get("matricule", "") for s in students]
+    department = state.get("department") or infer_department(students)
+    if not level:
+        level = state.get("level", "")
+
+    catalogs = find_catalogs(str(FORM_B_DIR), department, int(level) if level else 0)
+    for c in catalogs:
+        c.pop("path", None)
+    return {"department": department, "level": level, "catalogs": catalogs}
+
+
+@app.route("/api/job/<job_id>/form-b")
+def api_form_b(job_id):
+    ctx = _job_form_b_context(job_id)
+    if ctx is None:
+        return jsonify({"error": "Unknown job"}), 404
+    with jobs_lock:
+        state = {k: jobs[job_id]["form_b"].get(k) for k in
+                 ("status", "catalog", "rows", "output_file", "error")}
+    return jsonify({**ctx, "state": state})
+
+
+@app.route("/api/job/<job_id>/form-b/generate", methods=["POST"])
+def api_form_b_generate(job_id):
+    data = request.get_json() or {}
+    catalog_name = (data.get("catalog") or "").strip()
+    ctx = _job_form_b_context(job_id)
+    if ctx is None:
+        return jsonify({"error": "Unknown job"}), 404
+
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Unknown job"}), 404
         raw = jobs[job_id]["_raw"]
-        stu_list = jobs[job_id]["students"]
+        meta = jobs[job_id].get("meta", {})
 
-    # Update in raw StudentRecord objects
-    for s in raw:
-        if s.matricule == old_mat:
-            s.matricule = new_mat
-            break
-    else:
-        return jsonify({"error":"Student not found in raw data"}),404
+    school_id = meta.get("school_id") or DEFAULT_SCHOOL_ID
+    year = meta.get("year") or ""
+    department = ctx["department"]
+    level = ctx["level"]
 
-    # Rebuild dict from updated raw record
-    for s in raw:
-        if s.matricule == new_mat:
-            sd = student_to_dict(s)
-            for i, ex in enumerate(stu_list):
-                if ex["matricule"] == old_mat:
-                    stu_list[i] = sd
-                    # Move errors key if present
-                    with jobs_lock:
-                        if old_mat in jobs[job_id]["errors"]:
-                            jobs[job_id]["errors"][new_mat] = jobs[job_id]["errors"].pop(old_mat)
-                        if sd["valid"]:
-                            jobs[job_id]["errors"].pop(new_mat, None)
-                        else:
-                            jobs[job_id]["errors"][new_mat] = sd["errors"]
-                    return jsonify({"student": sd, "old_matricule": old_mat, "new_matricule": new_mat})
-            break
+    # FORM B is derived from the uploaded transcripts (deduplicated across
+    # students). The official catalogue in form_b/ is only an optional
+    # reference used to produce a comparison report.
+    try:
+        rows, stats = derive_form_b_from_students(
+            raw, department=department, level=level, year=year,
+            school_id=school_id)
+    except Exception as e:
+        return jsonify({"error": f"Cross-check failed: {e}"}), 500
 
-    return jsonify({"error":"Could not apply override"}),500
+    catalog_compare = None
+    if catalog_name:
+        catalog_path = str(FORM_B_DIR / catalog_name)
+        catalog_compare = {"name": catalog_name}
+        if not os.path.isfile(catalog_path):
+            catalog_compare["error"] = "catalogue file not found in form_b/"
+        else:
+            try:
+                catalog = load_form_b(catalog_path)
+                cc = cross_check(raw, catalog)
+                catalog_compare["coverage"] = {cs["code"]: cs["count"]
+                                               for cs in cc["course_stats"]}
+                catalog_compare["per_student"] = [{
+                    "matricule": ps["matricule"], "name": ps["name"],
+                    "taken": ps["taken"], "matched": ps["matched"],
+                    "missing": [r["code"] for r in ps["missing"]],
+                    "unexpected": [u["code"] for u in ps["unexpected"]],
+                    "issues": ps["issues"],
+                } for ps in cc["students"]]
+                catalog_compare["catalog_count"] = cc["catalog_count"]
+            except Exception as e:
+                catalog_compare["error"] = str(e)
+
+    dept_tag = _safe_tag(department) or "DEPARTMENT"
+    lvl_tag  = _safe_tag(level) or "X"
+    fname = f"FORM_B_{dept_tag}_{lvl_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    out_path = str(OUTPUT_DIR / fname)
+    try:
+        build_form_b_excel(rows, stats, out_path)
+    except Exception as e:
+        return jsonify({"error": f"FORM B build failed: {e}"}), 500
+
+    with jobs_lock:
+        jobs[job_id]["form_b"].update({
+            "status": "done", "catalog": catalog_name,
+            "department": department, "level": level,
+            "rows": rows, "stats": stats, "output_file": fname, "error": None,
+        })
+    return jsonify({
+        "ok": True, "output_file": fname,
+        "department": department, "level": level,
+        "catalog": catalog_name, "source": "uploaded",
+        "stats": {
+            "catalog_count": stats["catalog_count"],
+            "student_count": stats["student_count"],
+            "courses": [{
+                "code": cs["code"], "description": cs["description"],
+                "semester": cs["semester"], "credit": cs["credit"],
+                "count": cs["count"],
+            } for cs in stats["course_stats"]],
+            "coverage": {cs["code"]: cs["count"] for cs in stats["course_stats"]},
+            "per_student": [{
+                "matricule": ps["matricule"], "name": ps["name"],
+                "taken": ps["taken"], "matched": ps["matched"],
+                "missing": ps["missing"], "unexpected": ps["unexpected"],
+                "issues": ps["issues"],
+            } for ps in stats["students"]],
+        },
+        "catalog_compare": catalog_compare,
+    })
+
+
+@app.route("/api/form-b/<filename>/download")
+def api_form_b_dl(filename):
+    path = OUTPUT_DIR / filename
+    if not path.exists(): return jsonify({"error":"Not found"}),404
+    return send_file(str(path), as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/api/history")
