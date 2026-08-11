@@ -1,0 +1,20 @@
+﻿.venv\Scripts\python.exe : Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+At line:1 char:32
++ $env:PYTHONIOENCODING="utf-8"; .venv\Scripts\python.exe -X utf8 -c "
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Could not get F...sed as 4 floats:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+simulated empty-matricule student: ANKWENA BRIAN ABUMO
+applied: 1 | failures: []
+LMU-NEW001 present: True
+NAME-BASED MIGRATION OK
