@@ -1,0 +1,30 @@
+﻿.venv\Scripts\python.exe : test_fuzzy_key (__main__.TestCodeKeys.test_fuzzy_key) ... ok
+At line:1 char:32
++ ... NG="utf-8"; .venv\Scripts\python.exe -X utf8 test_form_b.py 2>&1 | Ou ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (test_fuzzy_key ...zzy_key) ... ok:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+test_normalize (__main__.TestCodeKeys.test_normalize) ... ok
+test_credit_and_semester_mismatch (__main__.TestCrossCheck.test_credit_and_semester_mismatch) ... ok
+test_full (__main__.TestCrossCheck.test_full) ... ok
+test_canonical_credit_and_description (__main__.TestDeriveFormB.test_canonical_credit_and_description) ... ok
+test_dedupes_and_sorts (__main__.TestDeriveFormB.test_dedupes_and_sorts) ... ok
+test_detect_department (__main__.TestDetection.test_detect_department) ... ok
+test_find_catalogs_ranks_matching_first (__main__.TestDetection.test_find_catalogs_ranks_matching_first) ... ok
+test_infer_department_falls_back_to_matricule (__main__.TestDetection.test_infer_department_falls_back_to_matricule) 
+... ok
+test_infer_department_prefers_specialty (__main__.TestDetection.test_infer_department_prefers_specialty) ... ok
+test_majority_department (__main__.TestDetection.test_majority_department) ... ok
+test_majority_specialty (__main__.TestDetection.test_majority_specialty) ... ok
+test_parse_catalog_filename (__main__.TestDetection.test_parse_catalog_filename) ... ok
+test_add_form_b_sheet_to_results_workbook (__main__.TestExcel.test_add_form_b_sheet_to_results_workbook) ... ok
+test_build_form_b_excel (__main__.TestExcel.test_build_form_b_excel) ... ok
+test_catalog_exists (__main__.TestLoadFormB.test_catalog_exists) ... ok
+test_load_form_b (__main__.TestLoadFormB.test_load_form_b) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.804s
+
+OK
+    Γ£ô  Excel saved ΓåÆ C:\Users\landm\AppData\Local\Temp\tmp5qc34185\results.xlsx
