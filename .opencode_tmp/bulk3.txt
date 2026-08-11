@@ -1,0 +1,22 @@
+﻿.venv\Scripts\python.exe : Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+At line:1 char:32
++ $env:PYTHONIOENCODING="utf-8"; .venv\Scripts\python.exe -X utf8 -c "
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Could not get F...sed as 4 floats:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+Could not get FontBBox from font descriptor because None cannot be parsed as 4 floats
+upload: 200
+status: awaiting_confirmation | students: 11
+applied: 1 | failures: [{'error': 'Student LMU-ACC002 not found in raw data', 'new': 'LMU-ACC888', 'old': 'LMU-ACC002'}, {'error': 'Student NOPE-001 not found in raw data', 'new': 'LMU-ACC111', 'old': 'NOPE-001'}]
+LMU-ACC999 present: True | old gone: True
+single override: 200 LMU-ACC777
+BULK OK
