@@ -353,10 +353,51 @@ tr:hover td{background:var(--g0)}
             </div>
           </div>
           <div id="mc-body" class="card-body" style="display:none">
+            <div class="prog-wrap" style="margin:0 0 .75rem">
+              <div class="prog-bg"><div class="prog-bar" id="mc-prog-bar" style="width:0%"></div></div>
+              <div class="prog-lbl"><span id="mc-prog-lbl">0 / 0</span><span id="mc-prog-note"></span></div>
+            </div>
             <div id="mc-results"></div>
+          </div>
+          <div class="flex gap-2 aic" id="mc-years-row" style="padding:.5rem 1rem;flex-wrap:wrap;border-top:1px solid var(--g2)">
+            <span class="text-sm muted">Check years:</span>
+            <div id="mc-years" class="flex gap-2 aic" style="flex-wrap:wrap"></div>
+            <button class="btn btn-outline btn-sm" onclick="setMcYearsPreset('all')">All</button>
+            <button class="btn btn-outline btn-sm" onclick="setMcYearsPreset('recent')">Recent 3</button>
+            <span class="text-sm muted" id="mc-est"></span>
           </div>
         </div>
         <!-- ═══ END MATRICULE CHECK ═══ -->
+
+        <!-- ═══ FORM B CARD ═══ -->
+        <div class="card mb3" id="formb-card">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">📋 FORM B — Course Cross-Check</div>
+              <div class="card-sub">Built from the uploaded transcripts (optional cross-check against an official catalogue)</div>
+            </div>
+            <div class="flex gap-2 aic">
+              <span id="fb-status" class="text-sm muted"></span>
+              <button class="btn btn-primary" id="btn-fb-gen" onclick="generateFormB()" disabled>
+                📊 Cross-Check &amp; Generate FORM B
+              </button>
+            </div>
+          </div>
+          <div id="fb-body" class="card-body" style="display:none">
+            <div class="flex gap-2 aic" style="margin-bottom:.75rem;flex-wrap:wrap">
+              <span class="text-sm">Department: <b id="fb-dept" class="mono"></b></span>
+              <span class="text-sm">Level: <b id="fb-level" class="mono"></b></span>
+              <label class="text-sm muted" for="fb-catalog" style="margin-left:1rem">Official catalogue (optional)</label>
+              <select id="fb-catalog" style="max-width:340px"></select>
+            </div>
+            <div id="fb-prog" class="prog-wrap" style="margin:0 0 .75rem;display:none">
+              <div class="prog-bg"><div class="prog-bar" id="fb-prog-bar" style="width:0%"></div></div>
+              <div class="prog-lbl"><span id="fb-prog-lbl"></span></div>
+            </div>
+            <div id="fb-results"></div>
+          </div>
+        </div>
+        <!-- ═══ END FORM B ═══ -->
 
         <div class="stats-grid" id="stats-grid"></div>
         <div class="tabs">
@@ -432,7 +473,7 @@ tr:hover td{background:var(--g0)}
           </ol>
           <h3 style="font-size:14px;font-weight:600;color:var(--navy);margin-bottom:.5rem">Excel Output Format</h3>
           <ul style="padding-left:1.25rem;margin-bottom:1.1rem">
-            <li><strong>Results</strong> — Matricule · Subject Code · School ID · Test(/30) · Exam(/70) · Db1/Acc(Total/100) · Semester</li>
+            <li><strong>Results</strong> — Flat import-ready table: Matricule · Subject Code · Schoolid · Test · Exam · Db1/Acc (academic year) · Semester</li>
             <li><strong>Summary</strong> — One row per student with course counts and validation status</li>
             <li><strong>Legend</strong> — Colour key and column guide</li>
           </ul>
@@ -567,7 +608,7 @@ async function poll(){
       clearInterval(pollTimer);
       setChk('parse',true);setChk('validate',true);
       setStatus('ready','Ready');setFoot('#4ade80','● Ready');
-      loadStudents(); showView('review');
+      loadStudents(); showView('review'); loadFormB();
       toast(`Parsed ${d.student_count} students · ${d.error_count} with issues`,d.error_count?'warning':'success');
     }else if(d.status==='done'){
       clearInterval(pollTimer);
@@ -849,141 +890,362 @@ async function loadHistory(){
 // ════════════════════════════════════════════════════════════
 //  MATRICULE CROSS-CHECK
 // ════════════════════════════════════════════════════════════
-let mcResults = null;
+let mcResults = null, mcPoll = null, mcRunning = false;
+let mcSel = new Map();  // old matricule -> portal matricule (bulk migration selection)
+let mcYearOptions = [], mcSelYears = new Set(), mcYearLabel = 'recent 3 years';
+
+async function loadMcYears(){
+  try{
+    const r = await fetch('/api/academic-years');
+    const d = await r.json();
+    mcYearOptions = d.years || [];
+    mcSelYears = new Set(mcYearOptions.slice(0, 3));
+    renderMcYears();
+  }catch(e){}
+}
+
+function renderMcYears(){
+  const box = document.getElementById('mc-years');
+  if(!box) return;
+  box.innerHTML = '';
+  for(const y of mcYearOptions){
+    const on = mcSelYears.has(y);
+    const lb = document.createElement('label');
+    lb.className = 'chk'; lb.style.padding = '2px 6px';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = on;
+    cb.style.accentColor = 'var(--blue)';
+    cb.addEventListener('change', () => {
+      if(cb.checked) mcSelYears.add(y); else mcSelYears.delete(y);
+      updateMcEstimate();
+    });
+    lb.appendChild(cb);
+    lb.appendChild(document.createTextNode(' ' + y));
+    box.appendChild(lb);
+  }
+  updateMcEstimate();
+}
+
+function setMcYearsPreset(preset){
+  mcSelYears = preset === 'all' ? new Set(mcYearOptions) : new Set(mcYearOptions.slice(0, 3));
+  renderMcYears();
+}
+
+function updateMcEstimate(){
+  const est = document.getElementById('mc-est');
+  if(!est) return;
+  const n = students.length, yrs = mcSelYears.size;
+  if(!n || !yrs){ est.textContent = ''; return; }
+  const reqs = n * 6 * yrs;                       // phase-1 queries ≈ 6 per student
+  const mins = Math.max(1, Math.ceil(reqs / 66)); // ≈ 8 concurrent @ 0.12s apart
+  est.textContent = `≈ ${reqs.toLocaleString()} requests (${n} students × ${yrs} yr) · ~${mins} min`;
+  est.title = 'Rough phase-1 estimate; resolving students adds more queries.';
+}
+
+function setMcProg(checked, total){
+  const bar = document.getElementById('mc-prog-bar');
+  if(!bar) return;
+  const pct = total ? Math.round(checked/total*100) : 0;
+  bar.style.width = pct + '%';
+  const lbl = document.getElementById('mc-prog-lbl');
+  if(lbl) lbl.textContent = `${checked} / ${total}`;
+}
 
 async function runMatriculeCheck(){
-  if(!jobId) return;
-  const btn=document.getElementById('btn-mat-check');
-  const status=document.getElementById('mc-status');
-  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Checking…';
-  status.textContent='Querying Landmark portal…';
-  document.getElementById('mc-body').style.display='block';
-  document.getElementById('mc-results').innerHTML='<div style="text-align:center;padding:1.5rem;color:var(--g4)">Checking each student…</div>';
+  if(!jobId || mcRunning) return;
+  const btn = document.getElementById('btn-mat-check');
+  const status = document.getElementById('mc-status');
+  const years = [...mcSelYears];
+  if(!years.length){ toast('Select at least one academic year','warning'); return; }
+  mcYearLabel = years.join(' · ');
+  mcRunning = true;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Checking…';
+  status.textContent = `Starting portal check across ${years.length} year(s)…`;
+  document.getElementById('mc-body').style.display = 'block';
+  setMcProg(0, 0);
+  document.getElementById('mc-results').innerHTML = '<div style="text-align:center;padding:1.5rem;color:var(--g4)">Querying the Landmark portal…</div>';
 
   try{
-    const r=await fetch(`/api/job/${jobId}/matricule-check`,{method:'POST'});
-    const d=await r.json();
-    if(d.error){toast(d.error,'error');btn.disabled=false;btn.innerHTML='🔍 Check Matricules';return}
-    mcResults=d.results||[];
+    const r = await fetch(`/api/job/${jobId}/matricule-check`,
+      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({years})});
+    const d = await r.json();
+    if(d.error){ toast(d.error,'error'); mcRunning=false; resetMcBtn(); return; }
+    mcPoll = setInterval(pollMatCheck, 1500);
+    pollMatCheck();
+  }catch(e){
+    toast('Failed to start check: '+e.message,'error');
+    mcRunning = false; resetMcBtn();
+  }
+}
+
+async function pollMatCheck(){
+  try{
+    const r = await fetch(`/api/job/${jobId}/matricule-check`);
+    const d = await r.json();
+    setMcProg(d.checked || 0, d.total || 0);
+    if(d.status === 'running'){
+      document.getElementById('mc-status').textContent =
+        d.total ? `Checked ${d.checked} of ${d.total} students…` : 'Preparing queries…';
+      return;
+    }
+    clearInterval(mcPoll); mcPoll = null; mcRunning = false;
+    resetMcBtn();
+    if(d.status === 'failed'){
+      document.getElementById('mc-results').innerHTML =
+        `<div class="alert a-red"><div class="alert-icon">✗</div><div><div class="ab-title">Matricule check failed</div><div style="font-size:12px">${esc(d.error||'Unknown error')}</div></div></div>`;
+      document.getElementById('mc-status').textContent = 'Failed';
+      toast('Matricule check failed','error');
+      return;
+    }
+    mcResults = d.results || [];
     renderMatriculeResults(mcResults);
-    const mismatches=mcResults.filter(x=>x.mismatch).length;
-    const fuzzy=mcResults.filter(x=>x.api_matched&&!x.mismatch&&x.similarity<0.85).length;
-    const found=mcResults.filter(x=>x.api_matched).length;
-    const msgs=[];
-    if(mismatches) msgs.push(`${mismatches} mismatch(es)`);
-    if(fuzzy) msgs.push(`${fuzzy} suggestion(s)`);
-    if(msgs.length) toast(msgs.join(', ')+' — review below','warning');
-    else toast(`All ${found} students verified ✓`,'success');
-  }catch(e){toast('Matricule check failed: '+e.message,'error')}
-  btn.disabled=false; btn.innerHTML='🔍 Check Matricules';
-  status.textContent='';
+    const cnt = s => mcResults.filter(x => x.status === s).length;
+    const v = cnt('verified'), m = cnt('mismatch'), rv = cnt('review'), nf = cnt('not_found');
+    document.getElementById('mc-status').textContent =
+      `${v} verified · ${m} mismatch · ${rv} review · ${nf} not found`;
+    const msgs = [];
+    if(m) msgs.push(`${m} matricule mismatch(es)`);
+    if(rv) msgs.push(`${rv} need(s) review`);
+    if(msgs.length) toast(msgs.join(' — '),'warning');
+    else if(v) toast(`All ${v} students verified ✓`,'success');
+  }catch(e){}
+}
+
+function resetMcBtn(){
+  const btn = document.getElementById('btn-mat-check');
+  btn.disabled = false; btn.innerHTML = '↻ Re-check Matricules';
+}
+
+function mcKeyOf(r){
+  return (r.matricule || '') ? r.matricule : ('~' + (r.name || ''));
+}
+
+function mcSelToggle(key, newMat, name, on){
+  if(on && newMat) mcSel.set(key, {new: newMat, name});
+  else mcSel.delete(key);
+  renderMatriculeResults(mcResults);
+}
+
+function mcManualMat(key, name, el){
+  const v = el.value.trim().toUpperCase();
+  const row = el.closest('.mrow');
+  if(v) mcSel.set(key, {new: v, name});
+  else mcSel.delete(key);
+  if(row) row.querySelector('input[type=checkbox]').checked = !!v;
+  renderMcBulkBar();
+}
+
+function mcManualToggle(key, name, cb){
+  const row = cb.closest('.mrow');
+  const inp = row ? row.querySelector('input[type=text]') : null;
+  const v = inp ? inp.value.trim().toUpperCase() : '';
+  if(cb.checked){
+    if(!v){ toast('Enter a matricule first','warning'); cb.checked = false; return; }
+    mcSel.set(key, {new: v, name});
+  } else {
+    mcSel.delete(key);
+  }
+  renderMcBulkBar();
+}
+
+function setMcSelAll(which){
+  for(const r of (mcResults || [])){
+    const key = mcKeyOf(r);
+    const ok = which === 'all' || which === r.status;
+    if(ok && r.api_matricule) mcSel.set(key, {new: r.api_matricule, name: r.name});
+    else mcSel.delete(key);
+  }
+  renderMatriculeResults(mcResults);
+}
+
+function renderMcBulkBar(){
+  const host = document.getElementById('mc-bulk-bar');
+  if(!host) return;
+  const n = mcSel.size;
+  host.innerHTML = `<div class="flex gap-2 aic" style="margin:0 0 .75rem;padding:.5rem .75rem;background:var(--g1);border:1px solid var(--g2);border-radius:8px;flex-wrap:wrap">
+    <span class="text-sm muted">Bulk migrate:</span>
+    <button class="btn btn-outline btn-sm" onclick="setMcSelAll('mismatch')">Select mismatches</button>
+    <button class="btn btn-outline btn-sm" onclick="setMcSelAll('review')">Select reviews</button>
+    <button class="btn btn-outline btn-sm" onclick="setMcSelAll('all')">Select all matched</button>
+    ${n?`<button class="btn btn-primary btn-sm" onclick="bulkMigrate()">🚚 Migrate ${n} → portal</button>`:''}
+    ${n?`<button class="btn btn-outline btn-sm" onclick="setMcSelAll('none')">Clear</button>`:''}
+    <span class="text-sm muted">${n} selected</span>
+  </div>`;
+}
+
+function manualRow(r){
+  const key = mcKeyOf(r);
+  const cur = mcSel.get(key);
+  return `<div class="mrow" style="font-size:12px;padding:.3rem .5rem;background:var(--g0);border-radius:4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input type="checkbox" style="accent-color:var(--blue);width:14px;height:14px"
+      ${cur?'checked':''} onchange="mcManualToggle('${esc(key)}','${esc(r.name)}',this)">
+    <span style="color:var(--g5)">${esc(r.name||'(no name)')}</span>
+    <span class="mono" style="color:var(--g6)">${r.matricule?esc(r.matricule):'(no matricule)'}</span>
+    <input type="text" placeholder="New matricule…" value="${esc(cur?cur.new:'')}"
+      style="width:190px;font-size:12px;padding:.25rem .45rem;border:1px solid var(--g3);border-radius:6px;font-family:monospace"
+      oninput="mcManualMat('${esc(key)}','${esc(r.name)}',this)">
+    ${cur?`<button class="btn btn-sm btn-primary" onclick="bulkMigrate('${esc(key)}')">Migrate</button>`:''}
+  </div>`;
+}
+
+async function bulkMigrate(onlyKey){
+  if(!jobId) return;
+  const targets = onlyKey
+    ? new Map([[onlyKey, mcSel.get(onlyKey)]])
+    : new Map(mcSel);
+  if(!targets.size) return;
+  const n = targets.size;
+  if(!confirm(`Migrate ${n} student(s) to the matricule you provided?\n\nThis updates their matricule for the Excel export.`)) return;
+  const mappings = [...targets.entries()].map(([key, v]) => ({
+    old_matricule: key.startsWith('~') ? '' : key,
+    old_name: v.name,
+    new_matricule: v.new
+  }));
+  try{
+    const r = await fetch(`/api/job/${jobId}/matricule-bulk`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mappings})
+    });
+    const d = await r.json();
+    if(d.error){ toast(d.error,'error'); return; }
+    if(d.failures && d.failures.length)
+      toast(`${d.failures.length} failed: ${d.failures[0].error}`,'warning');
+    toast(`Migrated ${d.applied} of ${n} matricule(s)`,'success');
+    for(const [key, v] of [...targets]){
+      const x = mcResults.find(rr => mcKeyOf(rr) === key);
+      if(x){ x.matricule = v.new; x.status = 'verified'; x.mismatch = false; }
+      mcSel.delete(key);
+    }
+    await loadStudents();
+    renderMatriculeResults(mcResults);
+  }catch(e){ toast('Bulk migration failed: '+e.message,'error'); }
 }
 
 function renderMatriculeResults(results){
-  const c=document.getElementById('mc-results');
-  if(!results.length){c.innerHTML='<div class="alert a-blue"><div class="alert-icon">ℹ</div><div>No students to check.</div></div>';return}
+  const c = document.getElementById('mc-results');
+  if(!results.length){
+    c.innerHTML = '<div class="alert a-blue"><div class="alert-icon">ℹ</div><div>No students to check.</div></div>';
+    return;
+  }
+  const by = s => results.filter(x => x.status === s);
+  const verified = by('verified'), mismatched = by('mismatch'),
+        review = by('review'), notfound = by('not_found'), skipped = by('skipped');
+  const simPct = s => Math.round(s*100);
 
-  // Categorise intelligently
-  const mismatched=results.filter(x=>x.mismatch);
-  const fuzzy=results.filter(x=>x.api_matched&&!x.mismatch&&x.similarity<0.85);
-  const verified=results.filter(x=>x.api_matched&&!x.mismatch&&x.similarity>=0.85);
-  const notfound=results.filter(x=>!x.api_matched);
-
-  const simPct=s=>Math.round(s*100);
-
-  let html='';
-  // Summary badges
-  html+=`<div class="flex gap-2 aic" style="margin-bottom:1rem;flex-wrap:wrap">
+  let html = `<div class="flex gap-2 aic" style="margin-bottom:1rem;flex-wrap:wrap">
     <span class="badge bg-green">✓ ${verified.length} verified</span>
     ${mismatched.length?`<span class="badge bg-red">✗ ${mismatched.length} mismatch</span>`:''}
-    ${fuzzy.length?`<span class="badge bg-amber">? ${fuzzy.length} suggested</span>`:''}
+    ${review.length?`<span class="badge bg-amber">? ${review.length} review</span>`:''}
     ${notfound.length?`<span class="badge bg-grey">? ${notfound.length} not found</span>`:''}
+    ${skipped.length?`<span class="badge bg-grey">${skipped.length} skipped</span>`:''}
   </div>`;
 
-  // ── Mismatches (matricule differs from PDF) ──
+  const manualTargets = [...notfound, ...skipped].filter(r => r.matricule || r.name);
+  if(mismatched.length || review.length || manualTargets.length)
+    html += `<div id="mc-bulk-bar"></div>`;
+
   if(mismatched.length){
-    html+=`<div class="alert a-red mb3"><div class="alert-icon">⚠</div>
-      <div><div class="ab-title">${mismatched.length} student(s) have different matricules in the portal</div>
-      <div style="font-size:12px">Review below and override if the portal matricule is correct.</div></div></div>`;
-    for(const r of mismatched){
-      html+=renderMatchCard(r, 'red', simPct(r.similarity));
-    }
+    html += `<div class="alert a-red mb3"><div class="alert-icon">⚠</div>
+      <div><div class="ab-title">${mismatched.length} student(s) have a different matricule in the portal</div>
+      <div style="font-size:12px">Override if the portal matricule is correct.</div></div></div>`;
+    for(const r of mismatched) html += renderMatchCard(r, 'red', simPct(r.confidence));
   }
 
-  // ── Fuzzy / suggested matches (name differs, matricule may match) ──
-  if(fuzzy.length){
-    html+=`<div class="alert a-amber mb3"><div class="alert-icon">ℹ</div>
-      <div><div class="ab-title">${fuzzy.length} student(s) — possible portal match (low name confidence)</div>
-      <div style="font-size:12px">The portal name is similar but not identical. Verify before overriding.</div></div></div>`;
-    for(const r of fuzzy){
-      html+=renderMatchCard(r, 'amber', simPct(r.similarity));
-    }
+  if(review.length){
+    html += `<div class="alert a-amber mb3"><div class="alert-icon">ℹ</div>
+      <div><div class="ab-title">${review.length} student(s) need manual review</div>
+      <div style="font-size:12px">Low-confidence match — verify before overriding or generating Excel.</div></div></div>`;
+    for(const r of review) html += renderMatchCard(r, 'amber', simPct(r.confidence));
   }
 
-  // ── Verified matches ──
   if(verified.length){
-    html+=`<details style="margin-top:.5rem">
+    html += `<details style="margin-top:.5rem">
       <summary style="cursor:pointer;font-size:12px;color:var(--g5)">${verified.length} student(s) verified ✓</summary>
       <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:4px">`;
     for(const r of verified){
-      html+=`<div style="font-size:12px;padding:.25rem .5rem;background:var(--g0);border-radius:4px">
+      const yStr = r.years && r.years.length ? r.years.map(y=>esc(y)).join(', ') : '';
+      html += `<div style="font-size:12px;padding:.25rem .5rem;background:var(--g0);border-radius:4px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="mono" style="font-weight:500">${esc(r.matricule)}</span>
         <span style="color:var(--g5)"> — ${esc(r.name)}</span>
-        <span class="badge bg-green" style="font-size:10px">${simPct(r.similarity)}%</span>
+        ${yStr?`<span class="text-sm muted" style="margin-left:6px">(${yStr})</span>`:''}
+        <span class="badge bg-green" style="font-size:10px">${simPct(r.confidence)}%</span>
+        ${r.matricule_matched?'':'<span class="badge bg-amber" style="font-size:10px">name-matched</span>'}
       </div>`;
     }
-    html+=`</div></details>`;
+    html += `</div></details>`;
   }
 
-  // ── Not found ──
   if(notfound.length){
-    html+=`<details style="margin-top:.5rem">
-      <summary style="cursor:pointer;font-size:12px;color:var(--g5)">${notfound.length} student(s) not found in portal</summary>
-      <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:4px">`;
-    for(const r of notfound){
-      html+=`<div style="font-size:12px;padding:.25rem .5rem;background:var(--g0);border-radius:4px">
-        <span class="mono">${esc(r.matricule)}</span>
-        <span style="color:var(--g5)"> — ${esc(r.name)}</span>
-        ${r.error?`<span style="color:var(--g4)"> (${esc(r.error)})</span>`:''}
-      </div>`;
-    }
-    html+=`</div></details>`;
+    html += `<div style="margin-top:.5rem">
+      <div style="font-size:12px;font-weight:600;color:var(--g5);margin-bottom:.3rem">
+        ${notfound.length} student(s) not found in portal (searched ${mcYearLabel}) — type a matricule to assign</div>
+      <div style="display:flex;flex-direction:column;gap:4px">`;
+    for(const r of notfound) html += manualRow(r);
+    html += `</div></div>`;
   }
 
-  c.innerHTML=html;
+  if(skipped.length){
+    html += `<div style="margin-top:.5rem">
+      <div style="font-size:12px;font-weight:600;color:var(--g5);margin-bottom:.3rem">
+        ${skipped.length} student(s) skipped (no name) — assign a matricule if known</div>
+      <div style="display:flex;flex-direction:column;gap:4px">`;
+    for(const r of skipped) if(r.matricule || r.name) html += manualRow(r);
+    html += `</div></div>`;
+  }
+
+  c.innerHTML = html;
+  renderMcBulkBar();
 }
 
 function renderMatchCard(r, color, confidence){
-  const borderColor=color==='red'?'var(--red)':color==='amber'?'var(--amber)':'var(--g3)';
-  const btnClass=color==='red'?'btn-danger':'btn-primary';
-  const hasMulti=r.candidates&&r.candidates.length>1;
-  let candidateHtml='';
-  if(hasMulti){
-    candidateHtml=`<details style="margin-top:.5rem">
+  const borderColor = color==='red'?'var(--red)':color==='amber'?'var(--amber)':'var(--g3)';
+  const btnClass = color==='red'?'btn-danger':'btn-primary';
+  const yearTags = (years)=>years&&years.length?years.map(y=>`<span class="badge bg-grey" style="font-size:10px">${esc(y)}</span>`).join(' '):'';
+  let candidateHtml = '';
+  if(r.candidates && r.candidates.length){
+    candidateHtml = `<details style="margin-top:.5rem">
       <summary style="cursor:pointer;font-size:11px;color:var(--g5)">${r.candidates.length} candidate(s) found</summary>
       <div style="margin-top:.4rem;display:flex;flex-direction:column;gap:3px">`;
     for(const cand of r.candidates){
-      const isBest=cand.matricule===r.api_matricule;
-      candidateHtml+=`<div style="font-size:11px;padding:.2rem .4rem;background:var(--g0);border-radius:3px;display:flex;justify-content:space-between">
-        <span class="mono" style="font-weight:${isBest?600:400}">${esc(cand.matricule)} — ${esc(cand.name)}</span>
-        <span style="color:var(--g5)">${Math.round(cand.similarity*100)}% ${isBest?'← best':''}</span>
+      const isBest = cand.matricule === r.api_matricule;
+      const matSim = cand.matricule_similarity >= 1 ? 'mat = PDF'
+                   : cand.matricule_similarity >= 0.9 ? 'mat ≈ PDF (OCR)' : 'mat ≠ PDF';
+      candidateHtml += `<div style="font-size:11px;padding:.2rem .4rem;background:${isBest?'var(--blue-pale)':'var(--g0)'};border-radius:3px;display:flex;justify-content:space-between;align-items:center;gap:6px">
+        <div><span class="mono" style="font-weight:${isBest?600:400}">${esc(cand.matricule)}</span>
+        <span style="color:var(--g5)"> — ${esc(cand.name||'?')}</span>
+        ${cand.years && cand.years.length ? `<span style="margin-left:6px">${yearTags(cand.years)}</span>` : ''}</div>
+        <div class="flex gap-2 aic">
+          <span style="color:var(--g5)">${Math.round(cand.confidence*100)}% ${isBest?'← best':''} · ${matSim}</span>
+          ${isBest?'':`<button class="btn btn-sm btn-outline" style="padding:.2rem .5rem;font-size:11px"
+            onclick="event.stopPropagation();overrideMatricule('${esc(r.matricule)}','${esc(cand.matricule)}')">🔄 Select</button>`}
+        </div>
       </div>`;
     }
-    candidateHtml+=`</div></details>`;
+    candidateHtml += `</div></details>`;
   }
-  return `<div class="card" style="margin-bottom:.75rem;border-left:3px solid ${borderColor}">
+  const cardId = `mc-card-${esc(r.matricule||'').replace(/[^a-z0-9]/gi,'_')}`;
+  return `<div id="${cardId}" class="card" style="margin-bottom:.75rem;border-left:3px solid ${borderColor}">
     <div class="card-body" style="padding:.75rem 1rem">
       <div class="flex aic jbs" style="margin-bottom:.4rem">
-        <div><strong>${esc(r.name)}</strong> <span class="badge ${color==='red'?'bg-red':color==='amber'?'bg-amber':'bg-grey'}" style="font-size:10px">${confidence}%</span></div>
-        <button class="btn btn-sm ${btnClass}" onclick="overrideMatricule('${esc(r.matricule)}','${esc(r.api_matricule)}')">
-          🔄 Override → ${esc(r.api_matricule)}
-        </button>
+        <div class="flex aic" style="gap:8px">
+          <input type="checkbox" style="accent-color:var(--blue);width:15px;height:15px"
+            onchange="mcSelToggle('${esc(r.matricule)}','${esc(r.api_matricule||'')}','${esc(r.name)}',this.checked)"
+            ${mcSel.has(r.matricule)?'checked':''} ${r.api_matricule?'':'disabled'}>
+          <div><strong>${esc(r.name)}</strong> <span class="badge ${color==='red'?'bg-red':color==='amber'?'bg-amber':'bg-grey'}" style="font-size:10px">${confidence}%</span></div>
+        </div>
+        <div class="flex gap-2 aic">
+          <button class="btn btn-sm btn-outline" onclick="document.getElementById('${cardId}').remove()">✕ Dismiss</button>
+          ${r.api_matricule?`<button class="btn btn-sm ${btnClass}" onclick="overrideMatricule('${esc(r.matricule)}','${esc(r.api_matricule)}')">
+            🔄 Override → ${esc(r.api_matricule)}</button>`:''}
+        </div>
       </div>
       <div style="font-size:12px;display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">
         <span>PDF matricule: <span class="mono" style="color:var(--red);font-weight:600">${esc(r.matricule)}</span></span>
         <span>→</span>
         <span>Portal matricule: <span class="mono" style="color:var(--green);font-weight:600">${esc(r.api_matricule)}</span></span>
-        <span class="text-sm muted">Portal name: ${esc(r.api_name)}</span>
+        ${r.api_name?`<span class="text-sm muted">Portal name: ${esc(r.api_name)}</span>`:''}
+        ${r.matricule_matched?'<span class="badge bg-green" style="font-size:10px">matricule matches</span>':'<span class="badge bg-red" style="font-size:10px">matricule differs</span>'}
+        ${r.reason?`<span class="text-sm muted">${esc(r.reason)}</span>`:''}
       </div>
       ${candidateHtml}
     </div>
@@ -992,31 +1254,160 @@ function renderMatchCard(r, color, confidence){
 
 async function overrideMatricule(oldMat, newMat){
   if(!jobId) return;
-  if(!confirm(`Override matricule "${oldMat}" → "${newMat}"?\n\nThis will update the student's matricule in the current session.`)) return;
+  if(!confirm(`Override matricule "${oldMat}" → "${newMat}"?\n\nThis updates the student's matricule for the Excel export.`)) return;
 
   try{
-    const r=await fetch(`/api/job/${jobId}/matricule-override`,{
+    const r = await fetch(`/api/job/${jobId}/matricule-override`,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({old_matricule:oldMat,new_matricule:newMat})
     });
-    const d=await r.json();
-    if(d.error){toast(d.error,'error');return}
+    const d = await r.json();
+    if(d.error){ toast(d.error,'error'); return; }
     toast(`Matricule updated: ${oldMat} → ${newMat}`,'success');
-    // Refresh students list and re-run check
+    mcSel.delete(oldMat);
     await loadStudents();
     if(mcResults){
-      // Update local results
-      for(const r of mcResults){
-        if(r.matricule===oldMat){
-          r.matricule=newMat;
-          r.mismatch=false;
+      for(const x of mcResults){
+        if(x.matricule === oldMat){
+          x.matricule = newMat; x.status = 'verified';
+          x.mismatch = false; x.api_matricule = newMat;
           break;
         }
       }
       renderMatriculeResults(mcResults);
     }
-  }catch(e){toast('Override failed: '+e.message,'error')}
+  }catch(e){ toast('Override failed: '+e.message,'error'); }
+}
+
+// ════════════════════════════════════════════════════════════
+//  FORM B
+// ════════════════════════════════════════════════════════════
+let fbBusy = false;
+
+async function loadFormB(){
+  if(!jobId) return;
+  try{
+    const r = await fetch(`/api/job/${jobId}/form-b`);
+    const d = await r.json();
+    if(d.error) return;
+    document.getElementById('fb-dept').textContent = d.department || '—';
+    document.getElementById('fb-level').textContent = d.level || '—';
+    const sel = document.getElementById('fb-catalog');
+    const btn = document.getElementById('btn-fb-gen');
+    const catalogs = d.catalogs || [];
+    sel.innerHTML = `<option value="">None — from uploaded transcripts only</option>` +
+      catalogs.map((c,i)=>{
+        const label = `${c.department||'?'} · Level ${c.level||'?'}${i===0&&(d.department||d.level)?' (auto)':''}`;
+        return `<option value="${esc(c.name)}">${esc(label)} — ${esc(c.name)}</option>`;
+      }).join('');
+    sel.disabled = false;
+    btn.disabled = false;
+    document.getElementById('fb-body').style.display = 'block';
+    document.getElementById('fb-status').textContent =
+      catalogs.length ? `from uploads · ${catalogs.length} official catalogue(s) available`
+                      : 'from uploads · no official catalogue';
+  }catch(e){}
+}
+
+async function generateFormB(){
+  if(!jobId || fbBusy) return;
+  const btn = document.getElementById('btn-fb-gen');
+  const catalog = document.getElementById('fb-catalog').value;
+  fbBusy = true;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Cross-checking…';
+  document.getElementById('fb-status').textContent = 'Working…';
+  document.getElementById('fb-prog').style.display = 'block';
+  document.getElementById('fb-prog-bar').style.width = '0%';
+  document.getElementById('fb-prog-lbl').textContent = 'Matching courses…';
+  try{
+    const r = await fetch(`/api/job/${jobId}/form-b/generate`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({catalog})
+    });
+    const d = await r.json();
+    if(d.error){ toast(d.error,'error'); renderFormBError(d.error); return; }
+    renderFormBResult(d);
+    toast(`FORM B generated: ${d.catalog}`,'success');
+  }catch(e){
+    toast('FORM B failed: '+e.message,'error');
+    renderFormBError(e.message);
+  }finally{
+    fbBusy = false;
+    btn.disabled = false; btn.innerHTML = '↻ Re-run Cross-Check';
+  }
+}
+
+function renderFormBError(msg){
+  document.getElementById('fb-prog').style.display = 'none';
+  document.getElementById('fb-status').textContent = 'Failed';
+  document.getElementById('fb-results').innerHTML =
+    `<div class="alert a-red"><div class="alert-icon">✗</div><div><div class="ab-title">FORM B failed</div>
+    <div style="font-size:12px">${esc(msg)}</div></div></div>`;
+}
+
+function renderFormBResult(d){
+  document.getElementById('fb-prog').style.display = 'none';
+  document.getElementById('fb-status').textContent =
+    `Done — ${d.stats.catalog_count} courses from ${d.stats.student_count} students (uploads)`;
+  const st = d.stats || {};
+  const per = st.per_student || [];
+  const totalMissing = per.reduce((a,p)=>a+p.missing.length,0);
+  const totalUnexpected = per.reduce((a,p)=>a+p.unexpected.length,0);
+  const badStudents = per.filter(p=>p.missing.length||p.unexpected.length||p.issues.length).length;
+
+  let html = `<div class="flex gap-2 aic" style="margin-bottom:.75rem;flex-wrap:wrap">
+    <span class="badge bg-blue">${st.catalog_count||0} courses</span>
+    <span class="badge bg-blue">${st.student_count||0} students</span>
+    <span class="badge bg-green">source: uploaded transcripts</span>
+    <a class="btn btn-primary" style="text-decoration:none" href="/api/form-b/${encodeURIComponent(d.output_file)}/download">⬇ Download FORM B</a>
+  </div>`;
+
+  const cc = d.catalog_compare;
+  if(cc){
+    if(cc.error){
+      html += `<div class="alert a-amber" style="margin-top:.5rem"><div class="alert-icon">ℹ</div>
+        <div><div class="ab-title">Catalogue comparison skipped</div>
+        <div style="font-size:12px">${esc(cc.name)} — ${esc(cc.error)}</div></div></div>`;
+    }else{
+      const ccPer = cc.per_student || [];
+      const ccMissing = ccPer.reduce((a,p)=>a+p.missing.length,0);
+      const ccUnexpected = ccPer.reduce((a,p)=>a+p.unexpected.length,0);
+      html += `<details style="margin-top:.5rem" ${(ccMissing||ccUnexpected)?'open':''}>
+        <summary style="cursor:pointer;font-size:12px;color:var(--g5)">Official catalogue comparison — ${esc(cc.name)} (${cc.catalog_count||0} courses)</summary>
+        <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:4px">
+          <div class="flex gap-2 aic" style="flex-wrap:wrap">
+            <span class="badge ${ccMissing?'bg-amber':'bg-green'}">${ccMissing} missing vs catalogue</span>
+            <span class="badge ${ccUnexpected?'bg-amber':'bg-green'}">${ccUnexpected} not in catalogue</span>
+          </div>
+          <div style="max-height:260px;overflow:auto">
+            <table style="font-size:12px">
+              <thead><tr><th>Matricule</th><th>Name</th><th>Missing</th><th>Unexpected</th></tr></thead><tbody>`;
+      for(const p of ccPer){
+        const bad = p.missing.length||p.unexpected.length;
+        html += `<tr${bad?' style="background:var(--red-pale)"':''}>
+          <td class="mono">${esc(p.matricule)}</td><td>${esc(p.name)}</td>
+          <td style="text-align:center">${p.missing.length}</td><td style="text-align:center">${p.unexpected.length}</td></tr>`;
+      }
+      html += `</tbody></table></div></div></details>`;
+    }
+  }
+
+  html += `<details style="margin-top:.5rem" open>
+    <summary style="cursor:pointer;font-size:12px;color:var(--g5)">Course coverage (per course × students)</summary>
+    <div style="margin-top:.5rem;max-height:260px;overflow:auto">
+      <table style="font-size:12px">
+        <thead><tr><th>Course</th><th>Description</th><th>Sem</th><th>Credit</th><th>Taken by</th></tr></thead><tbody>`;
+  const courses = st.courses || [];
+  for(const c of courses){
+    html += `<tr><td class="mono">${esc(c.code)}</td><td>${esc(c.description)}</td>
+      <td style="text-align:center">${c.semester}</td><td style="text-align:center">${c.credit}</td>
+      <td style="text-align:center">${c.count} / ${st.student_count||0}</td></tr>`;
+  }
+  html += `</tbody></table></div></details>`;
+
+  document.getElementById('fb-results').innerHTML = html;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1043,9 +1434,10 @@ function toast(msg,type){
   document.getElementById('toasts').appendChild(t);
   setTimeout(()=>t.remove(),4200);
 }
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 
 setStatus('idle','Idle');
+loadMcYears();
 </script>
 </body>
 </html>
