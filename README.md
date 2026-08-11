@@ -27,7 +27,7 @@ http://localhost:5000
 ## Output Format
 
 The Excel file contains three sheets:
-- **Results** — Matricule · Subject Code · School ID · Test(/30) · Exam(/70) · Db1/Acc(Total/100) · Semester
+- **Results** — Flat, import-ready table: Matricule · Subject Code · Schoolid · Test · Exam · Db1/Acc (academic year) · Semester. Matricule repeated per course row, no merged/title rows.
 - **Summary** — One row per student with course counts and validation status
 - **Legend** — Colour key and column guide
 
