@@ -48,6 +48,15 @@ COL_CA    = ["ca / 30","ca/30","ca","test","ca30"]
 COL_EXAM  = ["exam / 70","exam/70","exam","exam70"]
 COL_TOTAL = ["total / 100","total/100","total"]
 
+# ── Grade bands (as printed on the transcripts) ─────────────────────────────
+GRADE_BANDS = {"A":(80,100),"B+":(70,79),"B":(60,69),"C+":(55,59),
+               "C":(50,54),"D+":(45,49),"D":(40,44),"F":(0,39)}
+
+def _grade_band(total):
+    for g,(lo,hi) in GRADE_BANDS.items():
+        if lo<=total<=hi: return g
+    return None
+
 # ── Colours ──────────────────────────────────────────────────────────────────
 DARK_BLUE  = "1F4E79"; MID_BLUE = "2E75B6"; PALE_BLUE = "EBF3FB"
 PALE_YELL  = "FFF2CC"; PALE_GREY = "F8F9FA"; PALE_GREEN = "E2EFDA"
@@ -82,23 +91,33 @@ log = Logger()
 # ═══════════════════════════════════════════════════════════════════════════
 class CourseRecord:
     __slots__ = ("code","title","status","credit_value","credit_earned",
-                 "ca","exam","total","grade_point","weighted","grade","semester")
+                 "ca","exam","total","grade_point","weighted","grade","semester",
+                 "total_only")
     def __init__(self,code,title,status,credit_value,credit_earned,
-                 ca,exam,total,grade_point,weighted,grade,semester):
+                 ca,exam,total,grade_point,weighted,grade,semester,total_only=False):
         self.code=code; self.title=title; self.status=status
         self.credit_value=credit_value; self.credit_earned=credit_earned
         self.ca=ca; self.exam=exam; self.total=total
         self.grade_point=grade_point; self.weighted=weighted
         self.grade=grade; self.semester=semester
+        self.total_only=total_only
 
     def validation_errors(self):
         e=[]
         if not self.code: e.append("missing subject code")
         if not (0<=self.ca<=30):   e.append(f"CA={self.ca} out of range [0–30]")
-        if not (0<=self.exam<=70): e.append(f"Exam={self.exam} out of range [0–70]")
+        exam_max = 100 if self.total_only else 70
+        if not (0<=self.exam<=exam_max): e.append(f"Exam={self.exam} out of range [0–{exam_max}]")
         computed = round(self.ca+self.exam,2)
         if abs(computed-self.total)>0.5:
             e.append(f"Total mismatch: {self.ca}+{self.exam}={computed} ≠ {self.total}")
+        gb = _grade_band(self.total)
+        if gb and self.grade and gb != self.grade.upper():
+            e.append(f"Grade {self.grade} doesn't match total {self.total} (expected {gb})")
+        if self.grade.upper()=="F" and self.credit_earned!=0:
+            e.append(f"Failed course but credit earned={self.credit_earned}")
+        if self.grade.upper()!="F" and self.credit_earned==0 and self.total>0:
+            e.append(f"Passing course ({self.total}) with credit earned=0")
         return e
 
 
@@ -133,6 +152,10 @@ class StudentRecord:
 def _f(val, default=0.0):
     try: return float(str(val).replace(",",".").strip())
     except: return default
+
+def _norm_code(val):
+    """Course codes arrive with stray spaces (e.g. 'ACC 17') — strip them."""
+    return re.sub(r"\s+", "", str(val or "")).upper()
 
 def _is_skip(row):
     if not row or not row[0]: return True
@@ -179,12 +202,17 @@ def _sem_from_text(text):
 # ═══════════════════════════════════════════════════════════════════════════
 def _student_header(text):
     info={}
+    # Value stops at the next known field label (e.g. "LEVEL:", "DATE AND
+    # PLACE OF BIRTH:"), at 2+ spaces, a newline, or end of text.
+    _labels = (r"(?:NAME AND SURNAME|DATE AND PLACE OF BIRTH|FACULTY|DEPARTMENT|"
+               r"SPECIALTY|PROGRAMME|PROGRAM|MATRICULE|GENDER|LEVEL|DATE|DEPT)")
+    stop = rf"(?=\s+{_labels}\b\s*:|\s{{2,}}|[\r\n]|$)"
     pats={
-        "name":      r"name and surname[:\s]+([^\n\r]+?)(?:\s{3,}|DATE|GENDER|$)",
+        "name":      r"name and surname[:\s]+([^\n\r]+?)" + stop,
         "matricule": r"matricule[:\s]+([A-Z0-9][A-Z0-9\-\s]{0,8}[A-Z0-9]+?)(?=\s{2,}|\s*(?:GENDER|FACULTY|DATE|DEPT|LEVEL|$))",
-        "faculty":   r"faculty[:\s]+([^\n\r]+?)(?:\s{3,}|DATE|DEPT|$)",
-        "specialty": r"specialty[:\s]+([^\n\r]+?)(?:\s{3,}|DATE|$)",
-        "department":r"department[:\s]+([^\n\r]+?)(?:\s{3,}|LEVEL|$)",
+        "faculty":   r"faculty[:\s]+([^\n\r]+?)" + stop,
+        "specialty": r"specialty[:\s]+([^\n\r]+?)" + stop,
+        "department":r"department[:\s]+([^\n\r]+?)" + stop,
         "level":     r"level[:\s]+(\d+)",
         "year":      r"academic transcript for\s+([\d/]+)",
     }
@@ -213,7 +241,7 @@ def parse_pdf(pdf_path, school_id=DEFAULT_SCHOOL_ID):
         hdr=_student_header(raw)
         mat=hdr.get("matricule",""); name=hdr.get("name","")
         if not mat:
-            log.warn(f"  Page {page_num}: no matricule found — skip"); continue
+            log.warn(f"  Page {page_num}: no matricule found ⚠️ — will convert with placeholder")
 
         s=StudentRecord(mat,name,hdr.get("faculty",""),hdr.get("specialty",""),
                         hdr.get("department",""),hdr.get("level",""),hdr.get("year",""))
@@ -261,13 +289,19 @@ def _parse_tables(tables, raw_text, student):
         for row in table[1:]:
             if _is_skip(row): continue
             if len(row)<=max(cm.values()): continue
-            code=str(row[cm["code"]]).strip() if cm.get("code") is not None else ""
-            if not code or not re.match(r"^[A-Z]{2,6}\d{0,4}$",code.replace(" ","")): continue
+            code=_norm_code(row[cm["code"]]) if cm.get("code") is not None else ""
+            if not code or not re.match(r"^[A-Z]{2,6}\d{0,4}$",code): continue
 
-            ca    = _f(row[cm["ca"]])    if cm.get("ca")    is not None else 0.0
-            exam  = _f(row[cm["exam"]])  if cm.get("exam")  is not None else 0.0
-            total = _f(row[cm["total"]]) if cm.get("total") is not None else round(ca+exam,2)
-            if total==0 and (ca+exam)>0: total=round(ca+exam,2)
+            total_only = cm.get("total") is not None and cm.get("ca") is None and cm.get("exam") is None
+            if total_only:
+                total = _f(row[cm["total"]])
+                ca    = round(total*0.3, 2)
+                exam  = round(total - ca, 2)
+            else:
+                ca    = _f(row[cm["ca"]])    if cm.get("ca")    is not None else 0.0
+                exam  = _f(row[cm["exam"]])  if cm.get("exam")  is not None else 0.0
+                total = _f(row[cm["total"]]) if cm.get("total") is not None else round(ca+exam,2)
+                if total==0 and (ca+exam)>0: total=round(ca+exam,2)
 
             student.courses.append(CourseRecord(
                 code=code,
@@ -279,7 +313,8 @@ def _parse_tables(tables, raw_text, student):
                 grade_point=_f(row[cm["grade_point"]]) if cm.get("grade_point") is not None else 0.0,
                 weighted   =_f(row[cm["weighted"]])    if cm.get("weighted")    is not None else 0.0,
                 grade=str(row[cm["grade"]]).strip()    if cm.get("grade")       is not None else "",
-                semester=sem
+                semester=sem,
+                total_only=total_only
             ))
 
 def _parse_text(raw, student):
@@ -289,6 +324,10 @@ def _parse_text(raw, student):
         r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+"
         r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+([A-F][+]?)$"
     )
+    crx_only=re.compile(
+        r"^([A-Z]{2,6}\d{0,4})\s+(.+?)\s+([CE])\s+"
+        r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+([A-F][+]?)$"
+    )
     for line in lines:
         line=line.strip()
         s=_sem_from_text(line)
@@ -296,11 +335,23 @@ def _parse_text(raw, student):
         m=crx.match(line)
         if m:
             student.courses.append(CourseRecord(
-                code=m.group(1),title=m.group(2).strip(),status=m.group(3),
+                code=_norm_code(m.group(1)),title=m.group(2).strip(),status=m.group(3),
                 credit_value=float(m.group(4)),credit_earned=float(m.group(5)),
                 ca=float(m.group(6)),exam=float(m.group(7)),total=float(m.group(8)),
                 grade_point=float(m.group(9)),weighted=float(m.group(10)),
                 grade=m.group(11),semester=cur
+            ))
+            continue
+        m=crx_only.match(line)
+        if m:
+            total=float(m.group(6))
+            ca=round(total*0.3,2)
+            student.courses.append(CourseRecord(
+                code=_norm_code(m.group(1)),title=m.group(2).strip(),status=m.group(3),
+                credit_value=float(m.group(4)),credit_earned=float(m.group(5)),
+                ca=ca,exam=round(total-ca,2),total=total,
+                grade_point=float(m.group(7)),weighted=float(m.group(8)),
+                grade=m.group(9),semester=cur,total_only=True
             ))
 
 
@@ -337,7 +388,7 @@ def _dcell(ws,r,c,v,fill=PALE_BLUE,bold=False,color="000000",ha="center"):
     x.alignment=Alignment(horizontal=ha,vertical="center")
     x.border=bdr; return x
 
-def build_excel(students, output_path, school_id=DEFAULT_SCHOOL_ID):
+def build_excel(students, output_path, school_id=DEFAULT_SCHOOL_ID, form_b_rows=None):
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Results"
 
     specialty  = students[0].specialty    if students else ""
@@ -346,64 +397,31 @@ def build_excel(students, output_path, school_id=DEFAULT_SCHOOL_ID):
     dept       = students[0].department   if students else ""
     title_txt  = f"STUDENT RESULTS — {specialty.upper() or 'ACADEMIC'} LEVEL {level}  |  {acad_year}"
 
-    ws.merge_cells("A1:G1")
-    c=ws["A1"]; c.value=title_txt
-    c.font=Font(name="Arial",bold=True,size=12,color=DARK_BLUE)
-    c.alignment=Alignment(horizontal="center",vertical="center")
-    c.fill=PatternFill("solid",fgColor=TITLE_BG); ws.row_dimensions[1].height=22
-
-    ws.merge_cells("A2:G2")
-    c=ws["A2"]
-    c.value=(f"School ID: {school_id}  |  Specialty: {specialty}  |  "
-             f"Dept: {dept}  |  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    c.font=Font(name="Arial",size=9,color="595959",italic=True)
-    c.alignment=Alignment(horizontal="center",vertical="center")
-    c.fill=PatternFill("solid",fgColor=INFO_BG); ws.row_dimensions[2].height=16
-
-    hdrs=["Matricule","Subject Code","School ID","Test\n(/30)","Exam\n(/70)","Db1/Acc\n(Total/100)","Semester"]
-    for col,h in enumerate(hdrs,1): _hcell(ws,3,col,h,DARK_BLUE,wrap=True)
-    ws.row_dimensions[3].height=30; ws.freeze_panes="A4"
+    # ── Flat, import-ready Results sheet ───────────────────────────────────
+    hdrs=["Matricule","Subject Code","Schoolid","Test","Exam","Db1/Acc","Semester"]
+    for col,h in enumerate(hdrs,1): _hcell(ws,1,col,h,DARK_BLUE,wrap=True)
+    ws.row_dimensions[1].height=22; ws.freeze_panes="A2"
 
     sem_fills={1:PALE_BLUE,2:PALE_YELL,3:"E8F5E9",4:"F3E5F5"}
-    row_idx=4
+    row_idx=2
 
     for student in students:
         if not student.courses: continue
-        courses_sorted=sorted(student.courses,key=lambda c:(c.semester,c.code))
-        n=len(courses_sorted); mat_start=row_idx
-
-        for i,course in enumerate(courses_sorted):
+        for course in student.courses:
             fill=sem_fills.get(course.semester,PALE_GREY)
             if course.validation_errors(): fill=RED_FILL
-            tcol=(RED_TXT if course.total<50 else GREEN_TXT if course.total>=70 else "1F4E79" if course.total>=60 else "000000")
+            mf="FFF2CC" if not student.matricule else PALE_GREY
 
-            mc=ws.cell(row_idx,1, student.matricule if i==0 else None)
-            mc.font=Font(name="Arial",bold=True,size=9)
-            mc.fill=PatternFill("solid",fgColor=PALE_GREY)
-            mc.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-            mc.border=bdr
-
+            _dcell(ws,row_idx,1,student.matricule,mf,ha="left")
             _dcell(ws,row_idx,2,course.code,   fill,ha="left")
             _dcell(ws,row_idx,3,school_id,     fill)
             _dcell(ws,row_idx,4,course.ca,     fill)
             _dcell(ws,row_idx,5,course.exam,   fill)
-            _dcell(ws,row_idx,6,course.total,  fill,bold=True,color=tcol)
+            _dcell(ws,row_idx,6,student.academic_year,fill)
             _dcell(ws,row_idx,7,course.semester,fill)
             ws.row_dimensions[row_idx].height=14; row_idx+=1
 
-        if n>1:
-            ws.merge_cells(start_row=mat_start,start_column=1,end_row=row_idx-1,end_column=1)
-            mc=ws.cell(mat_start,1)
-            mc.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-            mc.font=Font(name="Arial",bold=True,size=9); mc.border=bdr
-
-        for col in range(1,8):
-            sep=ws.cell(row_idx,col,None)
-            sep.fill=PatternFill("solid",fgColor="E9EFF7")
-            sep.border=Border(bottom=med)
-        ws.row_dimensions[row_idx].height=3; row_idx+=1
-
-    for col,w in enumerate([18,14,10,8,8,13,10],1):
+    for col,w in enumerate([18,14,10,8,8,12,10],1):
         ws.column_dimensions[get_column_letter(col)].width=w
 
     # ── Summary sheet ──────────────────────────────────────────────────────
@@ -420,8 +438,8 @@ def build_excel(students, output_path, school_id=DEFAULT_SCHOOL_ID):
 
     for r,s in enumerate(students,3):
         errs=s.validation_errors()
-        sf=PALE_GREEN if not errs else RED_FILL
-        sc=GREEN_TXT  if not errs else RED_TXT
+        sf=PALE_YELL if not s.matricule else (PALE_GREEN if not errs else RED_FILL)
+        sc="996600" if not s.matricule else (GREEN_TXT  if not errs else RED_TXT)
         sc_counts={};
         for c in s.courses: sc_counts[c.semester]=sc_counts.get(c.semester,0)+1
         row_data=[s.matricule,s.name,s.level,s.specialty,
@@ -447,26 +465,34 @@ def build_excel(students, output_path, school_id=DEFAULT_SCHOOL_ID):
         (4,PALE_YELL,"Second Semester rows"),
         (5,"E8F5E9", "Third Semester rows"),
         (6,RED_FILL, "Data error — value out of valid range"),
-        (7,PALE_GREY,"Alternating student separator"),
+        (7,"FFF2CC", "No matricule found — manual review needed"),
+        (8,PALE_GREY,"Alternating student separator"),
     ]:
         ws3.cell(row,1).fill=PatternFill("solid",fgColor=fill)
         ws3.cell(row,1).value=f"  {desc}"
         ws3.cell(row,1).font=Font(name="Arial",size=10)
 
     guides=[
-        (9, "Matricule",         "Student registration number"),
-        (10,"Subject Code",      "Course code (e.g. ACC202, FRE101)"),
-        (11,"School ID",         f"Institution identifier — value: {school_id}"),
-        (12,"Test (/30)",        "Continuous Assessment mark, out of 30"),
-        (13,"Exam (/70)",        "Examination mark, out of 70"),
-        (14,"Db1/Acc (Total)",   "CA + Exam. Red<50, Blue 60–69, Green≥70"),
-        (15,"Semester",          "1=First, 2=Second, 3=Third, etc."),
+        (10,"Matricule",         "Student registration number (repeated per course row)"),
+        (11,"Subject Code",      "Course code (e.g. ACC202, FRE101)"),
+        (12,"Schoolid",          f"Institution identifier — value: {school_id}"),
+        (13,"Test",              "Continuous Assessment mark, out of 30"),
+        (14,"Exam",              "Examination mark, out of 70"),
+        (15,"Db1/Acc",           "Academic year (e.g. 2023/2024)"),
+        (16,"Semester",          "1=First, 2=Second, 3=Third, etc."),
     ]
-    ws3.cell(8,1,"COLUMN GUIDE").font=Font(name="Arial",bold=True,size=11,color=DARK_BLUE)
+    ws3.cell(9,1,"COLUMN GUIDE").font=Font(name="Arial",bold=True,size=11,color=DARK_BLUE)
     for row,cn,desc in guides:
         ws3.cell(row,1,cn).font=Font(name="Arial",bold=True,size=10)
         ws3.cell(row,2,desc).font=Font(name="Arial",size=10)
     ws3.column_dimensions["A"].width=22; ws3.column_dimensions["B"].width=55
+
+    if form_b_rows:
+        try:
+            from form_b import add_form_b_sheet
+            add_form_b_sheet(wb, form_b_rows)
+        except Exception as e:
+            log.warn(f"Form B sheet skipped: {e}")
 
     wb.save(str(output_path))
     log.ok(f"Excel saved → {output_path}")
