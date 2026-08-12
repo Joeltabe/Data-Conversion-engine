@@ -154,8 +154,10 @@ def _f(val, default=0.0):
     except: return default
 
 def _norm_code(val):
-    """Course codes arrive with stray spaces (e.g. 'ACC 17') — strip them."""
-    return re.sub(r"\s+", "", str(val or "")).upper()
+    """Course codes arrive with stray spaces (e.g. 'ACC 17') and trailing
+    punctuation (e.g. 'CET14.') — strip them."""
+    code = re.sub(r"\s+", "", str(val or "")).upper()
+    return code.rstrip(".").rstrip()
 
 def _is_skip(row):
     if not row or not row[0]: return True
@@ -166,7 +168,7 @@ def _col_map(header):
     m={}
     for i,c in enumerate(header):
         if c is None: continue
-        h=str(c).strip().lower()
+        h=re.sub(r"\s+", " ", str(c).strip().lower())
         for n in COL_CODE:
             if n in h: m.setdefault("code",i)
         for n in COL_TITLE:
@@ -187,7 +189,8 @@ def _col_map(header):
 
 def _is_course_hdr(row):
     if not row: return False
-    return any(n in " ".join(str(c).lower() for c in row if c) for n in COL_CODE)
+    norm=" ".join(re.sub(r"\s+"," ",str(c).lower()) for c in row if c)
+    return any(n in norm for n in COL_CODE)
 
 def _sem_from_text(text):
     t=text.lower()
@@ -204,17 +207,35 @@ def _student_header(text):
     info={}
     # Value stops at the next known field label (e.g. "LEVEL:", "DATE AND
     # PLACE OF BIRTH:"), at 2+ spaces, a newline, or end of text.
-    _labels = (r"(?:NAME AND SURNAME|DATE AND PLACE OF BIRTH|FACULTY|DEPARTMENT|"
+    _labels = (r"(?:NAME AND SURNAME|DATE AND PLACE OF\s*BIRTH|FACULTY|DEPARTMENT|"
                r"SPECIALTY|PROGRAMME|PROGRAM|MATRICULE|GENDER|LEVEL|DATE|DEPT)")
     stop = rf"(?=\s+{_labels}\b\s*:|\s{{2,}}|[\r\n]|$)"
+
+    # Name — handles the standard "NAME AND SURNAME: X" form plus the
+    # multi-line layouts seen on results sheets where the label is split
+    # ("NAME AND : X" + "SURNAME Y") and where "DATE AND PLACE OF BIRTH:"
+    # is broken across lines. The name always stops before the DOB / the
+    # next header field, so stray date text is never captured.
+    name_block = None
+    m = re.search(
+        r"name\s+and\s*(?:surname)?\s*[:]?\s*"
+        r"(.*?)"
+        r"(?=\s*(?:date\s+and\s+place|matricule|gender|faculty|department|"
+        r"specialty|level|programme|program|results\s+for|course\s+code|$))",
+        text, re.IGNORECASE | re.DOTALL)
+    if m:
+        name_block = m.group(1)
+        name_block = re.sub(r"\b(?:surname|name\s+and)\b", " ", name_block,
+                            flags=re.IGNORECASE)
+        info["name"] = " ".join(name_block.split())
+
     pats={
-        "name":      r"name and surname[:\s]+([^\n\r]+?)" + stop,
         "matricule": r"matricule[:\s]+([A-Z0-9][A-Z0-9\-\s]{0,8}[A-Z0-9]+?)(?=\s{2,}|\s*(?:GENDER|FACULTY|DATE|DEPT|LEVEL|$))",
         "faculty":   r"faculty[:\s]+([^\n\r]+?)" + stop,
         "specialty": r"specialty[:\s]+([^\n\r]+?)" + stop,
         "department":r"department[:\s]+([^\n\r]+?)" + stop,
         "level":     r"level[:\s]+(\d+)",
-        "year":      r"academic transcript for\s+([\d/]+)",
+        "year":      r"(?:academic transcript for|results\s+for)\s+([\d/]+)",
     }
     for k,p in pats.items():
         m=re.search(p,text,re.IGNORECASE)
@@ -320,12 +341,12 @@ def _parse_tables(tables, raw_text, student):
 def _parse_text(raw, student):
     lines=raw.split("\n"); cur=1
     crx=re.compile(
-        r"^([A-Z]{2,6}\d{0,4})\s+(.+?)\s+([CE])\s+"
+        r"^([A-Z]{2,6}\d{0,4}\.?\b)\s+(.+?)\s+([CE])\s+"
         r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+"
         r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+([A-F][+]?)$"
     )
     crx_only=re.compile(
-        r"^([A-Z]{2,6}\d{0,4})\s+(.+?)\s+([CE])\s+"
+        r"^([A-Z]{2,6}\d{0,4}\.?\b)\s+(.+?)\s+([CE])\s+"
         r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+([A-F][+]?)$"
     )
     for line in lines:
@@ -353,6 +374,49 @@ def _parse_text(raw, student):
                 grade_point=float(m.group(7)),weighted=float(m.group(8)),
                 grade=m.group(9),semester=cur,total_only=True
             ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PDF SPLITTER  (combined Results PDF → one PDF per student)
+# ═══════════════════════════════════════════════════════════════════════════
+def _safe_filename(txt, max_len=60):
+    txt = re.sub(r"[^\w\-. ]+", "", txt or "").strip().replace(" ", "_")
+    return (txt or "STUDENT")[:max_len]
+
+def split_results_pdf(pdf_path, out_dir, school_id=DEFAULT_SCHOOL_ID):
+    """Split a combined results PDF (one student per page) into individual
+    per-student PDFs. Returns list of (matricule, name, filename, source_page)."""
+    from pypdf import PdfReader, PdfWriter
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    written = []
+    try:
+        reader = PdfReader(str(pdf_path))
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                try: raw = page.extract_text() or ""
+                except Exception: raw = ""
+                if "matricule" not in raw.lower():
+                    log.info(f"  Page {page_num}: skip (no student)"); continue
+
+                hdr = _student_header(raw)
+                mat = hdr.get("matricule", "").replace(" ", "")
+                name = hdr.get("name", "")
+                if not mat:
+                    log.warn(f"  Page {page_num}: no matricule — skip split"); continue
+
+                base = f"{mat}_{_safe_filename(name)}" if mat else _safe_filename(name)
+                fname = f"{base}.pdf"; out = out_dir / fname
+
+                writer = PdfWriter()
+                writer.add_page(reader.pages[page_num - 1])
+                with open(out, "wb") as f:
+                    writer.write(f)
+                written.append((mat, name, fname, page_num))
+                log.ok(f"  Page {page_num}: {mat} — {name} → {fname}")
+    except Exception as e:
+        log.err(f"Split failed: {e}")
+    return written
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -506,6 +570,10 @@ def main():
     ap.add_argument("inputs",nargs="+",help="PDF file(s)")
     ap.add_argument("--output","-o",default=None)
     ap.add_argument("--school-id","-s",type=int,default=DEFAULT_SCHOOL_ID)
+    ap.add_argument("--split",action="store_true",
+                    help="Also split each combined results PDF into per-student PDFs")
+    ap.add_argument("--split-dir",default=None,
+                    help="Output folder for split PDFs (default: <pdf>_split/)")
     ap.add_argument("--no-confirm",action="store_true")
     args=ap.parse_args()
 
@@ -519,6 +587,14 @@ def main():
         if not os.path.isfile(p): log.err(f"Not found: {p}"); continue
         all_students.extend(parse_pdf(p, args.school_id))
     if not all_students: log.err("No students extracted."); sys.exit(1)
+
+    if args.split:
+        log.section("STEP 1b — Splitting combined PDFs")
+        for p in args.inputs:
+            if not os.path.isfile(p): continue
+            split_dir = Path(args.split_dir) if args.split_dir else Path(p).parent / (Path(p).stem + "_split")
+            log.info(f"Splitting: {Path(p).name} → {split_dir}")
+            split_results_pdf(p, split_dir, args.school_id)
 
     log.section("STEP 2/4 — Validation")
     passed,failed,errors=validate_all(all_students)
