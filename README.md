@@ -43,9 +43,27 @@ python pdf_to_excel_engine.py results.pdf -o Output.xlsx --school-id 10
 # Merge multiple PDFs into one Excel
 python pdf_to_excel_engine.py acc.pdf fin.pdf mgt.pdf --batch -o merged.xlsx
 
+# Split a combined results PDF into one PDF per student
+python pdf_to_excel_engine.py results.pdf --split -o Output.xlsx
+
+# Split to a custom folder (default: <pdf>_split next to the source)
+python pdf_to_excel_engine.py results.pdf --split --split-dir "F:\out"
+
 # Skip confirmation prompt
 python pdf_to_excel_engine.py results.pdf --no-confirm
 ```
+
+## Split Combined Results PDFs
+
+The engine recognises the multi-student **"STUDENT RESULTS"** sheets that the
+exam office publishes (one student per page, with `NAME AND SURNAME`,
+`MATRICULE`, and `First Semester Results For 2025/2026`).
+
+- **CLI:** pass `--split` to also export one PDF per student alongside the Excel.
+- **Web UI:** after uploading such a PDF, click **✂ Split PDFs** in the Review
+  bar — the app produces a ZIP of `MATRICULE_NAME.pdf` files for download.
+- Split files re-parse cleanly as single-student transcripts, so they can be
+  uploaded individually or archived per student.
 
 ## Project Structure
 
