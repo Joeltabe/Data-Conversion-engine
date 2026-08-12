@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, send_file, render_template, send_from
 
 sys.path.insert(0, os.path.dirname(__file__))
 from pdf_to_excel_engine import (
-    parse_pdf, validate_all, build_excel,
+    parse_pdf, validate_all, build_excel, split_results_pdf,
     StudentRecord, CourseRecord, DEFAULT_SCHOOL_ID, log as engine_log
 )
 from matchers import (
@@ -202,7 +202,10 @@ def api_upload():
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         jobs[job_id] = {"status":"parsing","progress":0,"log":[],"students":[],
-                        "errors":{},"_raw":[],"output_file":None,"meta":{},"dismissed_errors":False,
+                        "errors":{},"_raw":[],"output_file":None,"meta":{},
+                        "dismissed_errors":False,
+                        "pdf_paths": saved,
+                        "split":{"status":"idle","files":[],"zip":None,"error":None},
                         "mat_check":{"status":"idle","progress":0,"results":[],"checked":0,"total":0},
                         "form_b":{"status":"idle","catalog":None,"department":"","level":"",
                                   "rows":[],"stats":None,"output_file":None,"error":None}}
@@ -266,6 +269,70 @@ def api_download(job_id):
     if not path.exists(): return jsonify({"error":"File missing"}),404
     return send_file(str(path), as_attachment=True, download_name=fname,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ── Split combined results PDF → per-student PDFs ──────────────────────────
+def run_split_job(job_id):
+    from zipfile import ZipFile
+    def push(msg, level="info"):
+        with jobs_lock:
+            jobs[job_id]["log"].append({"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level})
+    try:
+        with jobs_lock:
+            paths = list(jobs[job_id].get("pdf_paths") or [])
+            jobs[job_id]["split"]["status"] = "running"
+        all_files = []
+        zip_name = f"split_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        zip_path = OUTPUT_DIR / zip_name
+        with ZipFile(str(zip_path), "w") as zf:
+            for p in paths:
+                push(f"Splitting: {Path(p).name}")
+                split_dir = OUTPUT_DIR / f"split_{job_id}"
+                split_dir.mkdir(parents=True, exist_ok=True)
+                results = split_results_pdf(p, split_dir)
+                for mat, name, fname, page in results:
+                    zf.write(str(split_dir / fname), arcname=fname)
+                    all_files.append({"matricule": mat, "name": name, "file": fname, "page": page})
+                    push(f"  {mat} — {name} → {fname}", "ok")
+        with jobs_lock:
+            jobs[job_id]["split"].update({
+                "status": "done", "files": all_files, "zip": zip_name, "error": None})
+        push(f"Split complete: {len(all_files)} PDF(s) → {zip_name}", "ok")
+    except Exception as e:
+        push(f"Split failed: {e}", "error")
+        with jobs_lock:
+            jobs[job_id]["split"].update({"status": "failed", "error": str(e)})
+
+
+@app.route("/api/job/<job_id>/split", methods=["POST"])
+def api_split(job_id):
+    with jobs_lock:
+        if job_id not in jobs: return jsonify({"error":"Unknown job"}),404
+        st = jobs[job_id]["split"]
+        if st["status"] == "running":
+            return jsonify({"ok": True, "running": True})
+    threading.Thread(target=run_split_job, args=(job_id,), daemon=True).start()
+    return jsonify({"ok": True, "running": True})
+
+
+@app.route("/api/job/<job_id>/split")
+def api_split_status(job_id):
+    with jobs_lock:
+        if job_id not in jobs: return jsonify({"error":"Unknown job"}),404
+        st = jobs[job_id]["split"]
+    return jsonify(st)
+
+
+@app.route("/api/job/<job_id>/split/download")
+def api_split_download(job_id):
+    with jobs_lock:
+        if job_id not in jobs: return jsonify({"error":"Unknown job"}),404
+        zip_name = jobs[job_id]["split"].get("zip")
+    if not zip_name: return jsonify({"error":"Split not ready"}),400
+    path = OUTPUT_DIR / zip_name
+    if not path.exists(): return jsonify({"error":"File missing"}),404
+    return send_file(str(path), as_attachment=True, download_name=zip_name,
+                     mimetype="application/zip")
 
 
 @app.route("/api/job/<job_id>/student/<matricule>", methods=["PATCH"])
@@ -582,14 +649,15 @@ def _apply_override_locked(job_id, old_mat, new_mat, old_name=None):
 def api_matricule_override(job_id):
     data = request.get_json() or {}
     old_mat = (data.get("old_matricule") or "").strip()
+    old_name = (data.get("old_name") or "").strip()
     new_mat = (data.get("new_matricule") or "").strip()
-    if not old_mat or not new_mat:
-        return jsonify({"error": "old_matricule and new_matricule required"}), 400
+    if (not old_mat and not old_name) or not new_mat:
+        return jsonify({"error": "old_matricule (or old_name) and new_matricule required"}), 400
 
     with jobs_lock:
         if job_id not in jobs:
             return jsonify({"error": "Unknown job"}), 404
-        ok, payload = _apply_override_locked(job_id, old_mat, new_mat)
+        ok, payload = _apply_override_locked(job_id, old_mat, new_mat, old_name=old_name)
     status = 404 if "not found" in payload.get("error", "") else 400
     return jsonify(payload), (200 if ok else status)
 
