@@ -441,6 +441,7 @@ tr:hover td{background:var(--g0)}
         <div class="flex gap-2 aic">
           <span id="ci-ovrd" class="text-sm muted hidden">✏ Edits pending</span>
           <button class="btn btn-outline btn-sm" onclick="dismissErrors()">Acknowledge Errors &amp; Proceed</button>
+          <button class="btn btn-outline" id="btn-split" onclick="splitPdfs()">✂ Split PDFs</button>
           <button class="btn btn-success btn-lg" id="btn-gen" onclick="generateExcel()">✅ Generate Excel</button>
         </div>
       </div>
@@ -744,15 +745,24 @@ function openDetail(mat){
   if(!s) return;
   activeStudent=s;
   document.getElementById('dp-name').textContent=s.name;
-  document.getElementById('dp-mat').textContent=`${s.matricule} · Level ${s.level||'?'} · ${s.specialty||''}`;
+  document.getElementById('dp-mat').textContent=`${s.matricule||'— no matricule —'} · Level ${s.level||'?'} · ${s.specialty||''}`;
   document.getElementById('dp-badge').innerHTML=`<span class="badge ${s.valid?'bg-green':'bg-red'}">${s.valid?'✓ Valid':'✗ Errors'}</span>`;
   document.getElementById('dp-save').classList.add('hidden');
 
   let html=`<div class="dp-meta">
+    <div class="dm-item" style="flex:2"><div class="dm-key">Matricule</div>
+      <div class="flex gap-2 aic" style="gap:6px">
+        <input type="text" id="dp-mat-input" class="mark-inp" style="width:190px;font-family:monospace"
+          value="${esc(s.matricule||'')}" placeholder="e.g. LMUI-25NWS046">
+        <button class="btn btn-sm btn-outline" onclick="updateMatricule()">✏ Update</button>
+      </div>
+    </div>
+    <div class="dm-item"><div class="dm-key">Source Page</div><div class="dm-val">${s.source_page||'–'}</div></div>
+  </div>
+  <div class="dp-meta">
     <div class="dm-item"><div class="dm-key">Faculty</div><div class="dm-val">${s.faculty||'–'}</div></div>
     <div class="dm-item"><div class="dm-key">Department</div><div class="dm-val">${s.department||'–'}</div></div>
     <div class="dm-item"><div class="dm-key">Academic Year</div><div class="dm-val">${s.academic_year||'–'}</div></div>
-    <div class="dm-item"><div class="dm-key">Source Page</div><div class="dm-val">${s.source_page||'–'}</div></div>
   </div>`;
 
   if(s.errors.length) html+=`<div class="alert a-red mb3"><div class="alert-icon">⚠</div><div><div class="ab-title">${s.errors.length} error(s)</div><ul>${s.errors.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div></div>`;
@@ -846,6 +856,33 @@ function closeDetail(e){
 }
 
 // ════════════════════════════════════════════════════════════
+//  MANUAL MATRICULE UPDATE
+// ════════════════════════════════════════════════════════════
+async function updateMatricule(){
+  if(!jobId || !activeStudent) return;
+  const inp=document.getElementById('dp-mat-input');
+  const newMat=(inp.value||'').trim();
+  const oldMat=activeStudent.matricule;
+  if(!newMat){ toast('Enter a matricule first','warning'); return; }
+  if(newMat===oldMat){ toast('Matricule unchanged','info'); return; }
+
+  const body = { new_matricule: newMat };
+  if(oldMat) body.old_matricule = oldMat;
+  else       body.old_name     = activeStudent.name;
+
+  try{
+    const r=await fetch(`/api/job/${jobId}/matricule-override`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.error){ toast(d.error,'error'); return; }
+    toast(`Matricule updated: ${oldMat||'(none)'} → ${newMat}`,'success');
+    delete patches[oldMat];
+    await loadStudents();
+    openDetail(newMat);
+  }catch(e){ toast('Update failed: '+e.message,'error'); }
+}
+
+// ════════════════════════════════════════════════════════════
 //  GENERATE EXCEL
 // ════════════════════════════════════════════════════════════
 async function dismissErrors(){if(!jobId)return;await fetch('/api/job/'+jobId+'/dismiss-errors',{method:'POST'});toast('Errors acknowledged — you can now generate Excel','warning')}
@@ -871,6 +908,43 @@ async function generateExcel(){
     setStatus('building','Building…');startPoll();
   }catch(e){toast('Request failed: '+e.message,'error')}finally{
     btn.disabled=false;btn.innerHTML='✅ Generate Excel';
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  SPLIT COMBINED PDF → PER-STUDENT PDFs
+// ════════════════════════════════════════════════════════════
+let splitPoll = null;
+
+async function splitPdfs(){
+  if(!jobId) return;
+  const btn=document.getElementById('btn-split');
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Splitting…';
+  try{
+    const r=await fetch('/api/job/'+jobId+'/split',{method:'POST'});
+    const d=await r.json();
+    if(d.error){toast(d.error,'error');return}
+    toast('Splitting combined PDF into per-student PDFs…','info');
+    splitPoll=setInterval(pollSplit,1500);
+  }catch(e){toast('Request failed: '+e.message,'error')}finally{
+    btn.disabled=false;btn.innerHTML='✂ Split PDFs';
+  }
+}
+
+async function pollSplit(){
+  if(!jobId) return;
+  const r=await fetch('/api/job/'+jobId+'/split');
+  const d=await r.json();
+  if(d.status==='running') return;
+  clearInterval(splitPoll);
+  if(d.status==='done'){
+    const n=d.files.length;
+    toast(`✅ ${n} student PDF(s) ready`,'success');
+    const a=document.createElement('a');
+    a.href='/api/job/'+jobId+'/split/download';
+    a.download=''; document.body.appendChild(a); a.click(); a.remove();
+  }else{
+    toast('Split failed: '+(d.error||'unknown error'),'error');
   }
 }
 
